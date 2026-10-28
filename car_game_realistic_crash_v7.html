@@ -1,0 +1,1273 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>3D Car Game - Rapier Vehicle Physics</title>
+<style>
+*{box-sizing:border-box}html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#91a8bc;color:#eef4fa;font:14px system-ui,sans-serif}
+canvas{display:block;width:100%;height:100%;outline:none}
+#hud{position:fixed;z-index:2;left:12px;top:12px;padding:10px 12px;min-width:210px;border:1px solid #344454;border-radius:8px;background:#101820df;pointer-events:none;box-shadow:0 5px 24px #0004}
+#hud strong{display:block;margin-bottom:4px}#stats{color:#a9c6db;font-variant-numeric:tabular-nums}#help{font-size:12px;color:#b8c2cd;margin-top:7px}
+#start{position:fixed;inset:0;z-index:3;display:grid;place-items:center;background:#070b10a8}
+.panel{max-width:380px;margin:20px;padding:24px;text-align:center;border:1px solid #506477;border-radius:12px;background:#131c26f2;box-shadow:0 18px 60px #0008}
+h1{font-size:24px;margin:0 0 8px}p{color:#c3d0dc}button{cursor:pointer;color:white;background:#2878ba;border:0;border-radius:7px;padding:10px 16px;font:inherit}button:hover{background:#328bd2}
+#crosshair{position:fixed;z-index:1;left:50%;top:50%;width:8px;height:8px;transform:translate(-50%,-50%);pointer-events:none}
+#crosshair:before,#crosshair:after{content:"";position:absolute;background:#fff9}#crosshair:before{width:8px;height:1px;left:0;top:3px}#crosshair:after{height:8px;width:1px;left:3px;top:0}
+#error{color:#ffb9a8;font-size:12px;white-space:pre-wrap}
+#load{position:fixed;z-index:2;right:14px;bottom:14px;display:none;grid-template-columns:repeat(2,50px);gap:5px;pointer-events:none;font:600 12px system-ui,sans-serif}
+#load b{height:50px;border-radius:7px;background:#2878ba;color:#fff;display:grid;place-items:center;border:1px solid #ffffff40;font-variant-numeric:tabular-nums}
+#loadlabel{grid-column:1/3;text-align:center;color:#c3d0dc;font-size:11px}
+</style>
+</head>
+<body>
+<div id="hud"><strong>3D Car Physics · Rapier Rigid Body</strong><div id="stats">Initializing WebGL…</div><div id="help">WASD move · Mouse look · Space jump<br>E enter/exit car · W/S drive · A/D steer · Space handbrake (drift)<br>Shift sprint when walking · R flip/reset car · P tyre model (Pacejka / GTA)<br>G gravity (Earth/Mars/Moon/Heavy) · T traction control · Y stability control · V engine sim</div></div>
+<div id="crosshair"></div>
+<div id="load"><div id="loadlabel">tyre load</div><b></b><b></b><b></b><b></b></div>
+<div id="start"><div class="panel"><h1>3D Engine Starter</h1><p>Rapier rigid-body physics with terrain, obstacle colliders, and raycast suspension. Requires an internet connection to load the physics engine.</p><p>Click below to capture the mouse and play.</p><button id="play">Start engine</button><p id="error"></p></div></div>
+<canvas id="view"></canvas>
+<script>
+(() => {
+'use strict';
+const canvas=document.getElementById('view'), stats=document.getElementById('stats'), start=document.getElementById('start'), play=document.getElementById('play'), error=document.getElementById('error');
+const gl=canvas.getContext('webgl',{alpha:false,antialias:true,powerPreference:'high-performance'});
+if(!gl){stats.textContent='WebGL unavailable';error.textContent='This browser or graphics driver could not create a WebGL context. Try enabling hardware acceleration in browser settings.';play.disabled=true;return;}
+const dExt=gl.getExtension('OES_standard_derivatives');
+const PREC='#ifdef GL_FRAGMENT_PRECISION_HIGH\nprecision highp float;\n#else\nprecision mediump float;\n#endif\n';
+// Sun shadow map (depth packed into RGBA8): 3x3 PCF lookup shared by the world and car shaders.
+const SHF=`uniform sampler2D uShadow; uniform float uShOn; uniform float uTexel;
+float unp(vec4 c){return dot(c,vec4(1.0,1.0/255.0,1.0/65025.0,1.0/16581375.0));}
+float shadowAt(vec4 s,float ndl){
+ if(uShOn<.5)return 1.0;
+ vec3 p=s.xyz/s.w*.5+.5;
+ if(p.x<0.0||p.x>1.0||p.y<0.0||p.y>1.0||p.z>1.0)return 1.0;
+ float bias=.0005+.0025*(1.0-ndl),sum=0.0;
+ for(int i=-1;i<=1;i++)for(int j=-1;j<=1;j++){float dd=unp(texture2D(uShadow,p.xy+vec2(float(i),float(j))*uTexel));sum+=(p.z-bias>dd)?0.0:1.0;}
+ return sum/9.0;}`;
+const vs=`attribute vec3 aPos; attribute vec3 aColor; uniform mat4 uViewProj; uniform mat4 uModel; uniform mat4 uLightVP; uniform vec3 uTint; varying vec3 vColor; varying vec3 vW; varying vec4 vS; void main(){vec4 w=uModel*vec4(aPos,1.0);gl_Position=uViewProj*w;vW=w.xyz;vS=uLightVP*w;vColor=aColor*uTint;}`;
+const fs=(dExt?'#extension GL_OES_standard_derivatives : enable\n':'')+PREC+SHF+`
+varying vec3 vColor; varying vec3 vW; varying vec4 vS; uniform vec3 uCam; uniform float uLit;
+void main(){
+ vec3 c=vColor;
+#ifdef GL_OES_standard_derivatives
+ if(uLit>.5){
+  // flat face normal from screen-space derivatives of world position (no normal buffers needed), turned toward the camera
+  vec3 n=normalize(cross(dFdx(vW),dFdy(vW))),vv=uCam-vW;if(dot(n,vv)<0.0)n=-n;
+  vec3 L=normalize(vec3(.45,.8,.35));float d=max(dot(n,L),0.0);
+  vec3 amb=mix(vec3(.30,.28,.26),vec3(.58,.65,.78),n.y*.5+.5);
+  c=vColor*(amb*.85+vec3(1.0,.95,.85)*d*.8*shadowAt(vS,d));
+  c=mix(c,vec3(.36,.46,.55),smoothstep(90.0,175.0,length(vv)));   // distance fog into the sky colour
+ }
+#endif
+ gl_FragColor=vec4(c,1.0);}`;
+function shader(type,src){const s=gl.createShader(type);gl.shaderSource(s,src);gl.compileShader(s);if(!gl.getShaderParameter(s,gl.COMPILE_STATUS))throw Error(gl.getShaderInfoLog(s));return s;}
+let program;
+try{program=gl.createProgram();gl.attachShader(program,shader(gl.VERTEX_SHADER,vs));gl.attachShader(program,shader(gl.FRAGMENT_SHADER,fs));gl.bindAttribLocation(program,0,'aPos');gl.bindAttribLocation(program,1,'aColor');gl.linkProgram(program);if(!gl.getProgramParameter(program,gl.LINK_STATUS))throw Error(gl.getProgramInfoLog(program));}
+catch(e){stats.textContent='Renderer setup failed';error.textContent=String(e);play.disabled=true;return;}
+gl.useProgram(program);
+const loc={pos:gl.getAttribLocation(program,'aPos'),color:gl.getAttribLocation(program,'aColor'),vp:gl.getUniformLocation(program,'uViewProj'),model:gl.getUniformLocation(program,'uModel'),tint:gl.getUniformLocation(program,'uTint'),lvp:gl.getUniformLocation(program,'uLightVP'),sh:gl.getUniformLocation(program,'uShadow'),shOn:gl.getUniformLocation(program,'uShOn'),texel:gl.getUniformLocation(program,'uTexel'),cam:gl.getUniformLocation(program,'uCam'),lit:gl.getUniformLocation(program,'uLit')};
+const floats=[];
+function vertex(x,y,z,c){floats.push(x,y,z,c[0],c[1],c[2]);}
+function quad(a,b,c,d,col){vertex(...a,col);vertex(...b,col);vertex(...c,col);vertex(...a,col);vertex(...c,col);vertex(...d,col);}
+function boxGeometry(){
+ const p=[[-.5,-.5,.5],[.5,-.5,.5],[.5,.5,.5],[-.5,.5,.5],[-.5,-.5,-.5],[.5,-.5,-.5],[.5,.5,-.5],[-.5,.5,-.5]];
+ const faces=[[0,1,2,3],[5,4,7,6],[4,0,3,7],[1,5,6,2],[3,2,6,7],[4,5,1,0]];
+ const shades=[[1,.99,.96],[.68,.72,.76],[.76,.79,.81],[.84,.86,.87],[.93,.94,.91],[.58,.62,.66]];
+ const data=[];for(let f=0;f<faces.length;f++){const [a,b,c,d]=faces[f],s=shades[f];for(const i of [a,b,c,a,c,d])data.push(...p[i],...s);}return new Float32Array(data);
+}
+const cubeData=boxGeometry(), cubeBuffer=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,cubeBuffer);gl.bufferData(gl.ARRAY_BUFFER,cubeData,gl.STATIC_DRAW);
+gl.enableVertexAttribArray(loc.pos);gl.vertexAttribPointer(loc.pos,3,gl.FLOAT,false,24,0);gl.enableVertexAttribArray(loc.color);gl.vertexAttribPointer(loc.color,3,gl.FLOAT,false,24,12);
+const cubeCount=cubeData.length/6;
+const cubeInstances=[];
+function addBox(x,y,z,w,h,d,color){cubeInstances.push({x,y:y-.5,z,w,h:h+1,d,color});}
+// Ground is a real triangulated heightfield, not a flat box.
+// Open spawn area: enclosure walls removed so the player and car can move freely.
+// A few cover blocks remain as obstacles.
+addBox(-5,1.3,-5,2,2.6,2,[.23,.28,.32]);addBox(4,.75,-8,3,1.5,2.4,[.65,.43,.25]);addBox(-3,.55,1,2.2,1.1,2.2,[.23,.28,.32]);addBox(6,.7,2,2.5,1.4,2.5,[.65,.43,.25]);
+for(let i=0;i<28;i++){const a=i/28*Math.PI*2,r=42+(i%4)*5,w=4+(i%3)*2,h=5+(i%6)*2,d=4+(i%2)*2;addBox(Math.cos(a)*r,h/2,Math.sin(a)*r,w,h,d,i%2?[.23,.28,.32]:[.48,.52,.55]);}
+const solids=cubeInstances.slice(),WORLD=105;
+// Gently uneven driving surface. The same height function drives the visible grid and wheel contact.
+// Ramps: wedges that rise toward local -Z (the high end). yaw rotates them like every other object.
+const RAMPS=[
+ {x:0,z:-22,yaw:0,w:6,l:10,h:2.2},                    // straight ahead of the spawn
+ {x:24,z:-14,yaw:Math.PI/2,w:5,l:8,h:1.4},
+ {x:-24,z:-16,yaw:-Math.PI/2,w:8,l:12,h:2.8},
+ {x:15,z:18,yaw:Math.PI,w:5,l:7,h:1.1},               // small kicker behind the spawn
+ {x:0,z:-66,yaw:0,w:7,l:18,h:4.2}];                   // big jump
+for(const r of RAMPS){r.c=Math.cos(r.yaw);r.s=Math.sin(r.yaw);}
+function rampLocal(r,x,z){const dx=x-r.x,dz=z-r.z;return [r.c*dx-r.s*dz,r.s*dx+r.c*dz];}
+function rampHeightAt(x,z){let best=-Infinity;for(const r of RAMPS){const [lx,lz]=rampLocal(r,x,z);if(Math.abs(lx)<=r.w/2&&Math.abs(lz)<=r.l/2){const y=(r.l/2-lz)/r.l*r.h;if(y>best)best=y;}}return best;}
+// The terrain eases to flat ground around each ramp so the ramp meets it cleanly (renderer and Rapier terrain both use groundHeight).
+function rampPad(x,z){let wt=0;for(const r of RAMPS){const [lx,lz]=rampLocal(r,x,z),d=Math.hypot(Math.max(Math.abs(lx)-r.w/2,0),Math.max(Math.abs(lz)-r.l/2,0)),u=Math.min(1,d/3.5);wt=Math.max(wt,1-u*u*(3-2*u));}return wt;}
+function rawGround(x,z){return Math.sin(x*.19+Math.sin(z*.11))*Math.sin(z*.16-x*.07)*.34 + Math.sin(x*.43+z*.31)*.075;}
+function groundHeight(x,z){return rawGround(x,z)*(1-rampPad(x,z));}
+function surfaceHeight(x,z){return Math.max(groundHeight(x,z),rampHeightAt(x,z));}   // terrain or ramp, whichever is higher
+// Conservative wheel-footprint contact: sample the center and tire perimeter so a tire
+// cannot cut through a sloped triangle between its center sample and its edge.
+function wheelContactHeight(x,z,r=.36){let h=surfaceHeight(x,z);for(let i=0;i<8;i++){const a=i*Math.PI/4;h=Math.max(h,surfaceHeight(x+Math.cos(a)*r,z+Math.sin(a)*r));}return h+.012;}
+function chassisSupportHeight(x,z,yaw,pitch,roll){const R=mul3(mul3(rotY(yaw),rotX(pitch)),rotZ(roll));let h=-Infinity;for(const lx of [-.92,0,.92])for(const lz of [-2.25,0,2.25]){const wx=x+R[0]*lx+R[6]*lz,wz=z+R[2]*lx+R[8]*lz;const localBottom=R[1]*lx+R[7]*lz;h=Math.max(h,surfaceHeight(wx,wz)-localBottom);}return h;}
+// Grid drawn as one batch of lines following the surface height
+const gridFloats=[];for(let i=-60;i<=60;i++){const c=i%10===0?[.26,.32,.31]:[.31,.37,.35];for(let j=-60;j<60;j+=2){gridFloats.push(i,groundHeight(i,j)+.018,j,...c,i,groundHeight(i,j+2)+.018,j+2,...c,j,groundHeight(j,i)+.018,i,...c,j+2,groundHeight(j+2,i)+.018,i,...c);}}
+const gridBuffer=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,gridBuffer);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(gridFloats),gl.STATIC_DRAW);
+// Triangulated terrain mesh follows the exact same height function used by the suspension.
+const terrainFloats=[];
+function terrainVertex(x,z){const y=groundHeight(x,z),shade=.92+Math.sin(x*.17+z*.13)*.035;terrainFloats.push(x,y,z,.32*shade,.39*shade,.30*shade);}
+for(let x=-105;x<105;x+=1.5)for(let z=-105;z<105;z+=1.5){terrainVertex(x,z);terrainVertex(x+1.5,z);terrainVertex(x+1.5,z+1.5);terrainVertex(x,z);terrainVertex(x+1.5,z+1.5);terrainVertex(x,z+1.5);}
+const terrainBuffer=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,terrainBuffer);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(terrainFloats),gl.STATIC_DRAW);
+const rampFloats=[];
+function rv(r,lx,ly,lz,c){rampFloats.push(r.x+r.c*lx+r.s*lz,ly,r.z-r.s*lx+r.c*lz,c[0],c[1],c[2]);}
+function rq(r,a,b,c,d,col){for(const p of [a,b,c,a,c,d])rv(r,p[0],p[1],p[2],col);}
+for(const r of RAMPS){const hw=r.w/2,hl=r.l/2,b=-.6,N=Math.max(4,Math.round(r.l/1.25));
+ for(let i=0;i<N;i++){const t0=i/N,t1=(i+1)/N,z0=hl-t0*r.l,z1=hl-t1*r.l,col=i%2?[.14,.15,.17]:[.88,.68,.12];
+  rq(r,[-hw,t0*r.h+.01,z0],[hw,t0*r.h+.01,z0],[hw,t1*r.h+.01,z1],[-hw,t1*r.h+.01,z1],col);}
+ rq(r,[-hw,b,hl],[-hw,0,hl],[-hw,r.h,-hl],[-hw,b,-hl],[.30,.33,.36]);
+ rq(r,[hw,b,hl],[hw,b,-hl],[hw,r.h,-hl],[hw,0,hl],[.30,.33,.36]);
+ rq(r,[-hw,b,-hl],[-hw,r.h,-hl],[hw,r.h,-hl],[hw,b,-hl],[.24,.26,.29]);}
+const rampBuffer=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,rampBuffer);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(rampFloats),gl.STATIC_DRAW);
+const keys=new Set(), player={x:0,y:1.7,z:5,r:.34};let yaw=0,pitch=0,vy=0,grounded=true,locked=false;
+let G=9.80665;const DRAG_K=9.80665/(55*55);let pvx=0,pvz=0,landDip=0;
+const car={x:0,y:.36,z:2.2,yaw:0,speed:0,steer:0,vl:0,vr:0,w:0,aL:0,aR:0,pitch:0,roll:0,pitchV:0,rollV:0,vy:0,thrS:0,spinF:0,spinR:0,brakeLit:false,occupied:false,engineDamage:0,steeringDamage:0,tireDamage:0,steeringPull:0};
+
+let cameraMode='walk',driveCameraYaw=0,driveOrbitYaw=0,driveOrbitPitch=-0.38;
+function identity(){return new Float32Array([1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1]);}
+function modelMatrix(o){const m=identity(),a=o.yaw||0,c=Math.cos(a),s=Math.sin(a);m[0]=c*o.w;m[2]=-s*o.w;m[5]=o.h;m[8]=s*o.d;m[10]=c*o.d;m[12]=o.x;m[13]=o.y;m[14]=o.z;return m;}
+function rotY(a){const c=Math.cos(a),s=Math.sin(a);return [c,0,-s,0,1,0,s,0,c];}
+function rotX(a){const c=Math.cos(a),s=Math.sin(a);return [1,0,0,0,c,s,0,-s,c];}
+function rotZ(a){const c=Math.cos(a),s=Math.sin(a);return [c,s,0,-s,c,0,0,0,1];}
+function mul3(A,B){const o=new Array(9);for(let j=0;j<3;j++)for(let i=0;i<3;i++)o[j*3+i]=A[i]*B[j*3]+A[3+i]*B[j*3+1]+A[6+i]*B[j*3+2];return o;}
+// ---------------- Low-poly car model ----------------
+// Body is lofted from cross-section rings (right half mirrored), with real wheel arches,
+// flat-shaded faces and a small lighting shader of its own.
+const GY=.36,FZ=-1.35,RZ=1.5,AR=.46,TRACK=.80,camPos=[0,0,0];
+const C_PAINT=[.045,.17,.48],C_GLASS=[.03,.05,.07],C_BLACK=[.018,.021,.026],C_DARK=[.035,.042,.052],C_LINER=[.012,.014,.018],C_TRIM=[.03,.032,.036];
+function pushTri(out,a,b,c,col,spec){
+ const ux=b[0]-a[0],uy=b[1]-a[1],uz=b[2]-a[2],vx=c[0]-a[0],vy=c[1]-a[1],vz=c[2]-a[2];
+ let nx=uy*vz-uz*vy,ny=uz*vx-ux*vz,nz=ux*vy-uy*vx;const l=Math.hypot(nx,ny,nz);if(l<1e-9)return;nx/=l;ny/=l;nz/=l;
+ for(const p of [a,b,c])out.push(p[0],p[1],p[2],nx,ny,nz,col[0],col[1],col[2],spec);
+}
+function pushTriDir(out,a,b,c,col,spec,dir){
+ const ux=b[0]-a[0],uy=b[1]-a[1],uz=b[2]-a[2],vx=c[0]-a[0],vy=c[1]-a[1],vz=c[2]-a[2];
+ const d=(uy*vz-uz*vy)*dir[0]+(uz*vx-ux*vz)*dir[1]+(ux*vy-uy*vx)*dir[2];
+ if(d<0)pushTri(out,a,c,b,col,spec);else pushTri(out,a,b,c,col,spec);
+}
+function pushTriOut(out,a,b,c,col,spec,o){
+ pushTriDir(out,a,b,c,col,spec,[(a[0]+b[0]+c[0])/3-o[0],(a[1]+b[1]+c[1])/3-o[1],(a[2]+b[2]+c[2])/3-o[2]]);
+}
+// Body: a smoothly interpolated loft of cross-sections (Catmull-Rom along the car) shaped like an ordinary 4-door saloon:
+// a flat, upright nose (the first ring is full size, so the front cap is a flat vertical fascia), a gently rising hood,
+// a raked windscreen, tall side glass, a flat roof, a sloped rear window and a short boot with a flat tail.
+// Corners are rounded and normals are SMOOTH, so the few polygons shade like a high-poly surface.
+// Underbody, sills and wheel liners stay faceted.
+// z, yb, W, Wb, ybelt, Wg, yg, Wr, yt  (W/Wb/Wg/Wr = half widths, y = height above ground; yg = top of the side glass)
+const BK=[
+[-2.30,.30,.900,.860,.76,.80,.77,.70,.80],[-2.22,.25,.940,.900,.79,.84,.80,.72,.83],[-1.80,.20,.965,.930,.84,.86,.85,.74,.875],
+[-1.20,.18,.975,.940,.89,.87,.90,.76,.93],[-.60,.18,.975,.940,.95,.87,.96,.78,.99],[-.20,.18,.975,.945,.96,.84,1.08,.66,1.16],
+[.25,.18,.975,.945,.97,.83,1.31,.68,1.40],[.70,.18,.980,.945,.98,.82,1.35,.66,1.43],[1.10,.18,.980,.945,.98,.82,1.34,.66,1.42],
+[1.45,.18,.980,.945,.97,.85,1.15,.70,1.21],[1.80,.20,.975,.940,.955,.87,.97,.74,.99],[2.10,.23,.950,.910,.95,.88,.96,.78,.97],
+[2.30,.26,.910,.880,.93,.80,.93,.72,.955]];
+function bAt(z){let i=0;while(i<BK.length-2&&z>BK[i+1][0])i++;
+ const A=BK[i],B=BK[i+1],P=BK[Math.max(0,i-1)],N=BK[Math.min(BK.length-1,i+2)],h=B[0]-A[0],t=Math.max(0,Math.min(1,(z-A[0])/h)),t2=t*t,t3=t2*t;
+ return A.slice(1).map((a,j)=>{const b=B[j+1],m0=(b-P[j+1])/(B[0]-P[0])*h,m1=(N[j+1]-a)/(N[0]-A[0])*h;return (2*t3-3*t2+1)*a+(t3-2*t2+t)*m0+(-2*t3+3*t2)*b+(t3-t2)*m1;});}
+function chaikin(U){const pts=[U[0]],so=[];for(let s=0;s<U.length-1;s++){const a=U[s],b=U[s+1];pts.push([.75*a[0]+.25*b[0],.75*a[1]+.25*b[1]]);so.push(s);pts.push([.25*a[0]+.75*b[0],.25*a[1]+.75*b[1]]);so.push(s);}pts.push(U[U.length-1]);so.push(U.length-2);return {pts,so};}
+function ringPts(z){
+ let [yb,W,Wb,ybe,Wg,yg,Wr,yt]=bAt(z);
+ let f=0;for(const zc of [FZ,RZ]){const u=Math.max(0,1-Math.abs(z-zc)/.7);f=Math.max(f,u*u*(3-2*u));}   // wheel-flare weight: fenders bulge out and up over the wheels
+ ybe+=.05*f;W+=.022*f-.02*(1-f);Wb+=.012*f-.05;Wg=Math.min(Wg,Wb-.03);Wr=Math.min(Wr,Wg-.03);yt=Math.max(yt,ybe+.03);yg=Math.max(yg,ybe+.01);
+ const h=ybe-yb,yg2=Math.max(ybe+.004,Math.min(yg,yt-.04));
+ const P=[[0,yb],[.72*W,yb],[.93*W,yb+.1*h],[.99*W-.02*(1-f),yb+.4*h],[W,yb+.7*h],[Wb,ybe],[Wg,yg2],[Wr,Math.max(yg2+.004,yt-.04)],[Wr*.72,Math.max(yg2+.006,yt-.01)],[0,yt]];
+ for(const zc of [FZ,RZ]){const dz=z-zc;if(Math.abs(dz)<=AR+.002){const c=GY+Math.sqrt(Math.max(0,AR*AR-dz*dz));P[1]=[.66,yb];P[2]=[.66,Math.max(c,yb+.1*h)];P[3]=[.99*W,Math.max(P[3][1],c)];P[4]=[W,Math.max(P[4][1],c+.002)];}}
+ const ch=chaikin(P.slice(3));return {P:P.slice(0,3).concat(ch.pts),K:['f','u','s'].concat(ch.so)};
+}
+function mat(zm,kd){
+ const arch=Math.abs(zm-FZ)<=AR+.01||Math.abs(zm-RZ)<=AR+.01,q=bAt(zm),gh=q[7]-q[3],ws=zm>-.52&&zm<.27,rw=zm>1.15&&zm<1.78,cab=zm>-.5&&zm<1.85&&gh>.1;
+ if(kd==='f')return [C_DARK,0];if(kd==='u')return [arch?C_LINER:C_DARK,0];if(kd==='s')return [arch?C_LINER:C_BLACK,.2];
+ if(kd===2)return cab&&zm>-.38&&zm<1.42?(zm>.29&&zm<.42?[C_TRIM,.3]:[C_GLASS,1]):[C_PAINT,.7];   // side glass with a B-pillar
+ if(kd===3)return cab?[C_TRIM,.3]:[C_PAINT,.7];                                                    // black window surround / A-pillar
+ if(kd>=4)return ws||rw?[C_GLASS,1]:[C_PAINT,.7];                                                   // windscreen + rear window
+ return [C_PAINT,.7];
+}
+function detailBox(out,cx,cy,cz,w,h,d,col,sp,tilt){
+ const ang=Math.atan(tilt||0),ca=Math.cos(ang),sa=Math.sin(ang);
+ const P=(sx,sy,sz)=>{const x=sx*w/2,y=sy*h/2,z=sz*d/2;return [cx+x,cy-GY+y*ca+z*sa,cz-y*sa+z*ca];};
+ const f=(a,b,c,e)=>{pushTri(out,a,b,c,col,sp);pushTri(out,a,c,e,col,sp);};
+ f(P(1,-1,-1),P(1,1,-1),P(1,1,1),P(1,-1,1));
+ f(P(-1,-1,1),P(-1,1,1),P(-1,1,-1),P(-1,-1,-1));
+ f(P(-1,1,1),P(1,1,1),P(1,1,-1),P(-1,1,-1));
+ f(P(-1,-1,-1),P(1,-1,-1),P(1,-1,1),P(-1,-1,1));
+ f(P(1,-1,1),P(1,1,1),P(-1,1,1),P(-1,-1,1));
+ f(P(-1,-1,-1),P(-1,1,-1),P(1,1,-1),P(1,-1,-1));
+}
+function buildBody(){
+ const out=[],zs=new Set();
+ for(let z=-2.3;z<2.301;z+=.1)zs.add(+z.toFixed(3));
+ for(const zc of [FZ,RZ])for(const d of [-.47,-.4,-.3,-.2,-.1,0,.1,.2,.3,.4,.47])zs.add(+(zc+d).toFixed(3));
+ const Z=[...zs].sort((x,y)=>x-y),R=Z.map(ringPts),M=R[0].P.length,V=(r,j)=>[r.P[j][0],r.P[j][1]-GY,r.z];
+ R.forEach((r,i)=>r.z=Z[i]);
+ const nq=Z.length-1,fn=[],sm=[],mt=[];
+ for(let i=0;i<nq;i++){fn.push([]);sm.push([]);mt.push([]);for(let j=0;j<M-1;j++){
+  const a=V(R[i],j),b=V(R[i],j+1),c=V(R[i+1],j+1),dd=V(R[i+1],j),ux=c[0]-a[0],uy=c[1]-a[1],uz=c[2]-a[2],vx=dd[0]-b[0],vy=dd[1]-b[1],vz=dd[2]-b[2];
+  let nx=uy*vz-uz*vy,ny=uz*vx-ux*vz,nz=ux*vy-uy*vx;const l=Math.hypot(nx,ny,nz)||1;fn[i].push([nx/l,ny/l,nz/l]);
+  const kd=R[i].K[j],m=mat((Z[i]+Z[i+1])/2,kd);mt[i].push(m);sm[i].push(typeof kd==='number'&&m[0]!==C_LINER);}}
+ const vn=(i,j,ii,jj)=>{if(!sm[i][j])return fn[i][j];let x=0,y=0,z=0;for(let qi=ii-1;qi<=ii;qi++)for(let qj=jj-1;qj<=jj;qj++){if(qi<0||qj<0||qi>=nq||qj>=M-1||!sm[qi][qj])continue;const n=fn[qi][qj];x+=n[0];y+=n[1];z+=n[2];}const l=Math.hypot(x,y,z)||1;return [x/l,y/l,z/l];};
+ const put=(p,n,sg,col,sp)=>out.push(sg*p[0],p[1],p[2],sg*n[0],n[1],n[2],col[0],col[1],col[2],sp);
+ for(let i=0;i<nq;i++)for(let j=0;j<M-1;j++){
+  const [col,sp]=mt[i][j],pa=V(R[i],j),pb=V(R[i],j+1),pc=V(R[i+1],j+1),pd=V(R[i+1],j),na=vn(i,j,i,j),nb=vn(i,j,i,j+1),nc=vn(i,j,i+1,j+1),nd=vn(i,j,i+1,j);
+  for(const sg of [1,-1])for(const [p,n] of [[pa,na],[pb,nb],[pc,nc],[pa,na],[pc,nc],[pd,nd]])put(p,n,sg,col,sp);}
+ const cap=(r,dir,minY)=>{const loop=[];for(let j=0;j<M;j++)loop.push(V(r,j));for(let j=M-2;j>=1;j--){const v=V(r,j);loop.push([-v[0],v[1],v[2]]);}
+  let cy=0;for(const p of loop)cy+=p[1];const c=[0,cy/loop.length,r.z];
+  for(let i=0;i<loop.length;i++){const a=loop[i],b=loop[(i+1)%loop.length],up=(a[1]+b[1]+c[1])/3+GY>minY;pushTriDir(out,c,a,b,up?C_PAINT:C_DARK,up?.7:.05,[0,0,dir]);}};
+ cap(R[0],-1,0);cap(R[R.length-1],1,0);
+ // --- details ---
+ const CHROME=[.62,.66,.72],PIPE=[.20,.21,.23],TAIL=[.80,.03,.04],LENS=[.74,.80,.86],AMBER=[.62,.30,.03],LAMP=[.62,.66,.70],PLATE=[.92,.92,.88];
+ for(const s of [1,-1]){
+  detailBox(out,s*.62,.665,-2.302,.42,.115,.05,C_BLACK,.15);                // headlamp housing on the flat nose
+  detailBox(out,s*.62,.665,-2.322,.39,.090,.012,LENS,.95);                  // clear headlamp lens
+  detailBox(out,s*.55,.665,-2.330,.16,.050,.010,LAMP,-1);                   // headlamp bulb
+  detailBox(out,s*.78,.665,-2.330,.09,.050,.010,AMBER,-1);                  // indicator
+  detailBox(out,s*.72,.40,-2.302,.20,.10,.04,C_BLACK,.2);                   // fog lamp housing
+  detailBox(out,s*.72,.40,-2.324,.14,.06,.01,LENS,.9);
+  detailBox(out,s*1.03,1.02,-.32,.16,.10,.20,C_PAINT,.7);                   // body-colour door mirror
+  detailBox(out,s*1.03,1.02,-.213,.14,.08,.012,C_GLASS,1);                  // mirror glass
+  for(const zz of [.14,.82])detailBox(out,s*.975,.88,zz,.03,.025,.15,CHROME,.85);   // door handles
+  for(const zz of [-.52,.36,1.00])detailBox(out,s*.968,.66,zz,.02,.40,.014,C_DARK,0);   // door shut lines
+  detailBox(out,s*.66,.80,2.305,.46,.13,.05,TAIL,-2);                       // tail lamps
+ }
+ detailBox(out,0,.64,-2.304,.82,.15,.04,C_BLACK,.3);                          // grille
+ for(const y of [.60,.64,.68])detailBox(out,0,y,-2.326,.78,.012,.012,CHROME,.85);
+ detailBox(out,0,.72,-2.322,.86,.02,.03,CHROME,.9);detailBox(out,0,.56,-2.322,.86,.02,.03,CHROME,.9);
+ for(const s of [1,-1])detailBox(out,s*.43,.64,-2.322,.02,.17,.03,CHROME,.9);
+ detailBox(out,0,.64,-2.334,.09,.06,.012,CHROME,.9);                          // badge
+ detailBox(out,0,.40,-2.302,1.0,.11,.04,C_BLACK,.2);                          // lower air intake
+ detailBox(out,0,.40,-2.325,.46,.11,.02,PLATE,.2);                            // front number plate
+ detailBox(out,0,.325,-2.30,1.2,.04,.03,C_BLACK,.2);                          // bumper lower trim
+ detailBox(out,0,.64,2.312,.50,.12,.03,PLATE,.2);                             // rear number plate
+ detailBox(out,0,.34,2.31,1.4,.12,.03,C_BLACK,.15);                           // rear bumper trim
+ detailBox(out,.55,.28,2.27,.10,.08,.20,PIPE,.8);                             // exhaust tip
+ detailBox(out,0,1.46,1.0,.04,.05,.12,C_BLACK,.3);                            // roof antenna
+ return out;
+}
+function buildWheel(){
+ const out=[],N=28,O=[0,0,0],TIRE=[.035,.035,.04],RIM=[.70,.72,.76],SPOKE=[.78,.80,.84],DARK=[.03,.032,.04],DISC=[.20,.20,.22],W=.13;
+ // Low-profile tyre: a lathed rounded cross-section with smooth normals (looks round, costs ~700 triangles).
+ const half=[[0,.360],[.085,.358],[.118,.346],[.131,.325],[.134,.300],[.128,.274],[.116,.262]];
+ const prof=half.slice().reverse().map(p=>[-p[0],p[1]]).concat(half.slice(1));
+ const pn=prof.map((p,i)=>{let nx=0,nr=0;for(const j of [i-1,i]){if(j<0||j>=prof.length-1)continue;const dx=prof[j+1][0]-prof[j][0],dr=prof[j+1][1]-prof[j][1],l=Math.hypot(dx,dr);nx+=-dr/l;nr+=dx/l;}const l=Math.hypot(nx,nr)||1;return [nx/l,nr/l];});
+ const vt=(k,a)=>[[prof[k][0],Math.cos(a)*prof[k][1],Math.sin(a)*prof[k][1]],[pn[k][0],Math.cos(a)*pn[k][1],Math.sin(a)*pn[k][1]]];
+ const put=(v,col,sp)=>out.push(v[0][0],v[0][1],v[0][2],v[1][0],v[1][1],v[1][2],col[0],col[1],col[2],sp);
+ const ang=i=>i/N*Math.PI*2,ring=(x,r0,r1,col,sp,dir)=>{for(let i=0;i<N;i++){const a0=ang(i),a1=ang(i+1),P=(r,a)=>[x,Math.cos(a)*r,Math.sin(a)*r];pushTriDir(out,P(r0,a0),P(r1,a0),P(r1,a1),col,sp,[dir,0,0]);pushTriDir(out,P(r0,a0),P(r1,a1),P(r0,a1),col,sp,[dir,0,0]);}};
+ for(let i=0;i<N;i++)for(let j=0;j<prof.length-1;j++){const A=vt(j,ang(i)),B=vt(j+1,ang(i)),C=vt(j+1,ang(i+1)),D=vt(j,ang(i+1));for(const v of [A,B,C,A,C,D])put(v,TIRE,.06);}
+ for(let i=0;i<N;i++){const a0=ang(i),a1=ang(i+1),am=(a0+a1)/2,P=(x,r,a)=>[x,Math.cos(a)*r,Math.sin(a)*r],dir=[0,-Math.cos(am),-Math.sin(am)];   // dark inner barrel
+  pushTriDir(out,P(-.11,.256,a0),P(.116,.256,a0),P(.116,.256,a1),DARK,.2,dir);pushTriDir(out,P(-.11,.256,a0),P(.116,.256,a1),P(-.11,.256,a1),DARK,.2,dir);}
+ ring(.118,.232,.262,RIM,.95,1);       // polished rim lip
+ ring(.03,.06,.236,DARK,.1,1);         // dish background so the spokes read
+ ring(.05,.105,.205,DISC,.55,1);       // brake rotor
+ const spoke=(an,r0,r1,w0,w1,xt,xb)=>{const d=[Math.cos(an),Math.sin(an)],n=[-d[1],d[0]],P=(r,o,x)=>[x,d[0]*r+n[0]*o,d[1]*r+n[1]*o],c=[(xt+xb)/2,d[0]*(r0+r1)/2,d[1]*(r0+r1)/2];
+  const T=[P(r0,-w0,xt),P(r0,w0,xt),P(r1,w1,xt),P(r1,-w1,xt)],B=[P(r0,-w0,xb),P(r0,w0,xb),P(r1,w1,xb),P(r1,-w1,xb)];
+  const q=(a,b,c2,e)=>{pushTriOut(out,a,b,c2,SPOKE,.9,c);pushTriOut(out,a,c2,e,SPOKE,.9,c);};q(T[0],T[1],T[2],T[3]);q(T[1],B[1],B[2],T[2]);q(T[0],T[3],B[3],B[0]);q(T[3],T[2],B[2],B[3]);};
+ for(let k=0;k<5;k++){const an=k/5*Math.PI*2;spoke(an,.05,.24,.044,.030,.112,.06);spoke(an+.20,.12,.245,.012,.020,.108,.07);spoke(an-.20,.12,.245,.012,.020,.108,.07);}   // five main spokes with fine twin-fingers
+ ring(.125,0,.058,RIM,.95,1);ring(.127,0,.024,DARK,.3,1);                    // hub + centre cap
+ return out;
+}
+const bodyData=buildBody(),wheelData=buildWheel();
+function makeMesh(arr){const buf=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,buf);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(arr),gl.STATIC_DRAW);return {buf,count:arr.length/10};}
+const bodyMesh=makeMesh(bodyData),wheelMesh=makeMesh(wheelData);
+// Car shader: per-face normals, sun + hemisphere light, specular and sky fresnel. spec<0 = emissive lamp.
+const cvs=`attribute vec3 aPos; attribute vec3 aColor; attribute vec3 aNormal; attribute float aSpec;
+uniform mat4 uViewProj; uniform mat4 uModel; uniform vec3 uCam; uniform mat4 uLightVP; varying vec4 vS;
+varying vec3 vN; varying vec3 vV; varying vec3 vColor; varying float vSpec; varying float vH;
+void main(){vH=aPos.y;vec4 w=uModel*vec4(aPos,1.0);gl_Position=uViewProj*w;vS=uLightVP*w;vN=(uModel*vec4(aNormal,0.0)).xyz;vV=uCam-w.xyz;vColor=aColor;vSpec=aSpec;}`;
+const cfs=PREC+SHF+`varying vec4 vS; varying vec3 vN; varying vec3 vV; varying vec3 vColor; varying float vSpec; uniform float uBrake; varying float vH; uniform float uAO;
+// Procedural sky for reflections: horizon-to-zenith gradient, dark ground below, sun disc + halo (HDR, so the glint blooms).
+vec3 skyEnv(vec3 r,vec3 L,float sunVis){
+ float h=clamp(r.y,-1.0,1.0);
+ vec3 hor=vec3(.88,.92,.96),zen=vec3(.18,.38,.78),gnd=vec3(.13,.12,.11);
+ vec3 c=h>0.0?mix(hor,zen,pow(h,.45)):mix(hor*.45,gnd,clamp(-h*2.5,0.0,1.0));   // bright horizon over dark ground = strong contrast on curved panels
+ float sd=max(dot(r,L),0.0);
+ return c+vec3(1.0,.9,.7)*(pow(sd,700.0)*9.0+pow(sd,28.0)*.3)*sunVis;}
+void main(){
+ if(vSpec<-0.5){vec3 e=vColor*1.4;if(vSpec<-1.5)e=vColor*mix(.6,2.4,uBrake);   // lamps are HDR-bright so they bloom
+  gl_FragColor=vec4(e,1.0);return;}
+ vec3 n=normalize(vN),V=normalize(vV),L=normalize(vec3(.45,.8,.35)),H=normalize(L+V);
+ float d=max(dot(n,L),0.0);
+ vec3 amb=mix(vec3(.09,.085,.08),vec3(.50,.58,.74),n.y*.5+.5);          // dark underside, sky-lit top
+ float ao=mix(1.0,mix(.38,1.0,smoothstep(-.30,.12,vH)),uAO);             // darker toward the sills and wheel wells
+ float sh=shadowAt(vS,d);vec3 c=vColor*(amb*.75*ao+vec3(1.0,.93,.80)*d*1.25*sh)+vColor*pow(1.0-max(dot(n,V),0.0),2.5)*vec3(.10,.16,.28)*.7;   // + cool rim light
+ float sp=(pow(max(dot(n,H),0.0),90.0)*1.8+pow(max(dot(n,H),0.0),14.0)*.22)*vSpec*sh;
+ float F=.04+.96*pow(1.0-max(dot(n,V),0.0),5.0),kr=clamp(vSpec,0.0,1.0)*(.04+.90*F);   // Schlick fresnel: glancing angles mirror the sky
+  vec3 refl=skyEnv(reflect(-V,n),L,sh);
+ c=mix(c,refl*mix(.6,1.0,ao),kr*.9)+vec3(.9,.95,1.0)*sp;
+ gl_FragColor=vec4(c,1.0);}`;
+let carProg;
+try{carProg=gl.createProgram();gl.attachShader(carProg,shader(gl.VERTEX_SHADER,cvs));gl.attachShader(carProg,shader(gl.FRAGMENT_SHADER,cfs));
+ ['aPos','aColor','aNormal','aSpec'].forEach((n,i)=>gl.bindAttribLocation(carProg,i,n));gl.linkProgram(carProg);
+ if(!gl.getProgramParameter(carProg,gl.LINK_STATUS))throw Error(gl.getProgramInfoLog(carProg));}
+catch(e){stats.textContent='Car shader failed';error.textContent=String(e);play.disabled=true;return;}
+const cu={vp:gl.getUniformLocation(carProg,'uViewProj'),model:gl.getUniformLocation(carProg,'uModel'),cam:gl.getUniformLocation(carProg,'uCam'),brake:gl.getUniformLocation(carProg,'uBrake'),lvp:gl.getUniformLocation(carProg,'uLightVP'),sh:gl.getUniformLocation(carProg,'uShadow'),shOn:gl.getUniformLocation(carProg,'uShOn'),texel:gl.getUniformLocation(carProg,'uTexel'),ao:gl.getUniformLocation(carProg,'uAO')};
+// ---- Shadow map resources: depth-only pass from the sun into a 2048^2 RGBA8 target ----
+const SM=2048,SUNN=(()=>{const v=[.45,.8,.35],l=Math.hypot(...v);return v.map(x=>x/l);})();
+let shadowProg=null,su=null,shOK=false,lightVP=new Float32Array(16);
+try{
+ const svs='attribute vec3 aPos; uniform mat4 uLightVP; uniform mat4 uModel; void main(){gl_Position=uLightVP*uModel*vec4(aPos,1.0);}';
+ const sfs=PREC+'vec4 pk(float d){vec4 e=fract(d*vec4(1.0,255.0,65025.0,16581375.0));e-=e.yzww*vec4(1.0/255.0,1.0/255.0,1.0/255.0,0.0);return e;} void main(){gl_FragColor=pk(gl_FragCoord.z);}';
+ shadowProg=gl.createProgram();gl.attachShader(shadowProg,shader(gl.VERTEX_SHADER,svs));gl.attachShader(shadowProg,shader(gl.FRAGMENT_SHADER,sfs));gl.bindAttribLocation(shadowProg,0,'aPos');gl.linkProgram(shadowProg);
+ if(!gl.getProgramParameter(shadowProg,gl.LINK_STATUS))throw Error(gl.getProgramInfoLog(shadowProg));
+ su={vp:gl.getUniformLocation(shadowProg,'uLightVP'),model:gl.getUniformLocation(shadowProg,'uModel')};
+ const tex=gl.createTexture(),rb=gl.createRenderbuffer();window._shFbo=gl.createFramebuffer();
+ gl.activeTexture(gl.TEXTURE1);gl.bindTexture(gl.TEXTURE_2D,tex);gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,SM,SM,0,gl.RGBA,gl.UNSIGNED_BYTE,null);
+ gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.NEAREST);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.NEAREST);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+ gl.bindRenderbuffer(gl.RENDERBUFFER,rb);gl.renderbufferStorage(gl.RENDERBUFFER,gl.DEPTH_COMPONENT16,SM,SM);
+ gl.bindFramebuffer(gl.FRAMEBUFFER,window._shFbo);gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,tex,0);gl.framebufferRenderbuffer(gl.FRAMEBUFFER,gl.DEPTH_ATTACHMENT,gl.RENDERBUFFER,rb);
+ shOK=gl.checkFramebufferStatus(gl.FRAMEBUFFER)===gl.FRAMEBUFFER_COMPLETE;gl.bindFramebuffer(gl.FRAMEBUFFER,null);gl.activeTexture(gl.TEXTURE0);
+}catch(e){shOK=false;console.warn('Shadows disabled:',e);}
+// Orthographic sun camera centred on the player/car, snapped to the shadow-texel grid so shadows don't shimmer while moving.
+function updateLightVP(cx,cy,cz){
+ const E=42,fx=-SUNN[0],fy=-SUNN[1],fz=-SUNN[2];
+ let rx=-fz,ry=0,rz=fx;const rl=Math.hypot(rx,ry,rz);rx/=rl;rz/=rl;
+ const ux=ry*fz-rz*fy,uy=rz*fx-rx*fz,uz=rx*fy-ry*fx,ts=2*E/SM;
+ const cr=Math.round((rx*cx+ry*cy+rz*cz)/ts)*ts,cu2=Math.round((ux*cx+uy*cy+uz*cz)/ts)*ts,cf=fx*cx+fy*cy+fz*cz;
+ const ex=rx*cr+ux*cu2+fx*cf+SUNN[0]*100,ey=ry*cr+uy*cu2+fy*cf+SUNN[1]*100,ez=rz*cr+uz*cu2+fz*cf+SUNN[2]*100,k=2/199,m=lightVP;
+ m[0]=rx/E;m[4]=ry/E;m[8]=rz/E;m[12]=-(rx*ex+ry*ey+rz*ez)/E;
+ m[1]=ux/E;m[5]=uy/E;m[9]=uz/E;m[13]=-(ux*ex+uy*ey+uz*ez)/E;
+ m[2]=fx*k;m[6]=fy*k;m[10]=fz*k;m[14]=-k*(fx*ex+fy*ey+fz*ez)-k-1;m[3]=0;m[7]=0;m[11]=0;m[15]=1;
+}
+// ---- Post-processing: HDR scene target -> bloom (bright pass + 2x separable blur at 1/4 res) -> FXAA + tone map ----
+const hfExt=gl.getExtension('OES_texture_half_float'),cbExt=gl.getExtension('EXT_color_buffer_half_float'),hfLin=gl.getExtension('OES_texture_half_float_linear');
+let postOK=true,postOn=false,post=null,bright=null,blurP=null,comp=null,quadBuf=null;
+function mkProg(fsSrc,names){
+ const pr=gl.createProgram();gl.attachShader(pr,shader(gl.VERTEX_SHADER,'attribute vec2 aP; varying vec2 vUv; void main(){vUv=aP*.5+.5;gl_Position=vec4(aP,0.0,1.0);}'));
+ gl.attachShader(pr,shader(gl.FRAGMENT_SHADER,PREC+fsSrc));gl.bindAttribLocation(pr,0,'aP');gl.linkProgram(pr);
+ if(!gl.getProgramParameter(pr,gl.LINK_STATUS))throw Error(gl.getProgramInfoLog(pr));
+ const u={};for(const n of names)u[n]=gl.getUniformLocation(pr,'u'+n);return {p:pr,u};
+}
+try{
+ quadBuf=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,quadBuf);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,1,-1,-1,1,1,1]),gl.STATIC_DRAW);
+ bright=mkProg(`varying vec2 vUv; uniform sampler2D uS; uniform vec2 uPx; uniform float uThr;
+ vec3 ex(vec2 o){return max(texture2D(uS,vUv+o*uPx).rgb-vec3(uThr),0.0);}
+ void main(){vec3 s=(ex(vec2(-1.5,-1.5))+ex(vec2(1.5,-1.5))+ex(vec2(-1.5,1.5))+ex(vec2(1.5,1.5)))*.25;gl_FragColor=vec4(min(s,vec3(1.0)),1.0);}`,['S','Px','Thr']);
+ blurP=mkProg(`varying vec2 vUv; uniform sampler2D uS; uniform vec2 uDir;
+ void main(){vec3 c=texture2D(uS,vUv).rgb*.227027;
+  c+=(texture2D(uS,vUv+uDir*1.3846).rgb+texture2D(uS,vUv-uDir*1.3846).rgb)*.316216;
+  c+=(texture2D(uS,vUv+uDir*3.2308).rgb+texture2D(uS,vUv-uDir*3.2308).rgb)*.070270;
+  gl_FragColor=vec4(c,1.0);}`,['S','Dir']);
+ comp=mkProg(`varying vec2 vUv; uniform sampler2D uS; uniform sampler2D uB; uniform vec2 uPx; uniform float uBl;
+ // Filmic shoulder: identity below 0.6 so the existing look is unchanged, then highlights roll off smoothly toward 1.0 instead of clipping.
+ vec3 tm(vec3 x){return min(x,vec3(.6))+.4*(1.0-exp(-max(x-vec3(.6),0.0)/.4));}
+ vec3 T(vec2 p){return tm(texture2D(uS,p).rgb);}
+ float lu(vec3 c){return dot(c,vec3(.299,.587,.114));}
+ void main(){   // compact FXAA (the HDR target has no MSAA), run on tone-mapped colour
+  vec3 nw=T(vUv+vec2(-1.0,-1.0)*uPx),ne=T(vUv+vec2(1.0,-1.0)*uPx),sw=T(vUv+vec2(-1.0,1.0)*uPx),se=T(vUv+vec2(1.0,1.0)*uPx),m=T(vUv);
+  float lnw=lu(nw),lne=lu(ne),lsw=lu(sw),lse=lu(se),lm=lu(m);
+  float lmin=min(lm,min(min(lnw,lne),min(lsw,lse))),lmax=max(lm,max(max(lnw,lne),max(lsw,lse)));
+  vec2 d=vec2(-((lnw+lne)-(lsw+lse)),((lnw+lsw)-(lne+lse)));
+  float dr=max((lnw+lne+lsw+lse)*.03125,1.0/128.0),rc=1.0/(min(abs(d.x),abs(d.y))+dr);
+  d=clamp(d*rc,vec2(-8.0),vec2(8.0))*uPx;
+  vec3 a=.5*(T(vUv+d*(1.0/3.0-.5))+T(vUv+d*(2.0/3.0-.5)));
+  vec3 b=a*.5+.25*(T(vUv+d*-.5)+T(vUv+d*.5));
+  float lb=lu(b);vec3 col=(lb<lmin||lb>lmax)?a:b;
+  gl_FragColor=vec4(col+texture2D(uB,vUv).rgb*uBl,1.0);}`,['S','B','Px','Bl']);
+}catch(e){postOK=false;console.warn('Post-processing disabled:',e);}
+function tgt(t,w,h,type,lin,depth){
+ if(!t.tex){t.tex=gl.createTexture();t.fb=gl.createFramebuffer();if(depth)t.rb=gl.createRenderbuffer();}
+ gl.activeTexture(gl.TEXTURE2);gl.bindTexture(gl.TEXTURE_2D,t.tex);gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,w,h,0,gl.RGBA,type,null);
+ const f=lin?gl.LINEAR:gl.NEAREST;gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,f);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,f);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+ gl.bindFramebuffer(gl.FRAMEBUFFER,t.fb);gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,t.tex,0);
+ if(depth){gl.bindRenderbuffer(gl.RENDERBUFFER,t.rb);gl.renderbufferStorage(gl.RENDERBUFFER,gl.DEPTH_COMPONENT16,w,h);gl.framebufferRenderbuffer(gl.FRAMEBUFFER,gl.DEPTH_ATTACHMENT,gl.RENDERBUFFER,t.rb);}
+ const ok=gl.checkFramebufferStatus(gl.FRAMEBUFFER)===gl.FRAMEBUFFER_COMPLETE;gl.bindFramebuffer(gl.FRAMEBUFFER,null);return ok;
+}
+function ensurePost(){
+ if(!postOK)return false;
+ const W=canvas.width,H=canvas.height;if(post&&post.W===W&&post.H===H)return true;
+ try{
+  post=post||{scene:{},a:{},b:{}};const bw=Math.max(1,W>>2),bh=Math.max(1,H>>2),hdr=!!(hfExt&&cbExt);
+  let ok=hdr?tgt(post.scene,W,H,hfExt.HALF_FLOAT_OES,!!hfLin,true):false;post.hdr=ok;
+  if(!ok)ok=tgt(post.scene,W,H,gl.UNSIGNED_BYTE,true,true);
+  ok=ok&&tgt(post.a,bw,bh,gl.UNSIGNED_BYTE,true,false)&&tgt(post.b,bw,bh,gl.UNSIGNED_BYTE,true,false);
+  gl.activeTexture(gl.TEXTURE0);if(!ok){postOK=false;return false;}
+  post.W=W;post.H=H;post.bw=bw;post.bh=bh;return true;
+ }catch(e){postOK=false;console.warn('Post-processing disabled:',e);return false;}
+}
+function bindMain(){gl.bindFramebuffer(gl.FRAMEBUFFER,postOn?post.scene.fb:null);gl.viewport(0,0,canvas.width,canvas.height);}
+function runPost(){
+ const W=post.W,H=post.H,bw=post.bw,bh=post.bh;
+ gl.disable(gl.DEPTH_TEST);gl.bindBuffer(gl.ARRAY_BUFFER,quadBuf);gl.vertexAttribPointer(0,2,gl.FLOAT,false,0,0);
+ const pass=(pr,fb,vw,vh,tex,set)=>{gl.useProgram(pr.p);gl.bindFramebuffer(gl.FRAMEBUFFER,fb);gl.viewport(0,0,vw,vh);gl.activeTexture(gl.TEXTURE2);gl.bindTexture(gl.TEXTURE_2D,tex);gl.uniform1i(pr.u.S,2);set(pr.u);gl.drawArrays(gl.TRIANGLE_STRIP,0,4);};
+ pass(bright,post.a.fb,bw,bh,post.scene.tex,u=>{gl.uniform2f(u.Px,1/W,1/H);gl.uniform1f(u.Thr,post.hdr?1.0:.82);});   // without an HDR target nothing exceeds 1.0, so lower the threshold
+ for(let k=0;k<2;k++){pass(blurP,post.b.fb,bw,bh,post.a.tex,u=>gl.uniform2f(u.Dir,1/bw,0));pass(blurP,post.a.fb,bw,bh,post.b.tex,u=>gl.uniform2f(u.Dir,0,1/bh));}
+ gl.activeTexture(gl.TEXTURE3);gl.bindTexture(gl.TEXTURE_2D,post.a.tex);
+ pass(comp,null,W,H,post.scene.tex,u=>{gl.uniform1i(u.B,3);gl.uniform2f(u.Px,1/W,1/H);gl.uniform1f(u.Bl,.7);});
+ gl.activeTexture(gl.TEXTURE3);gl.bindTexture(gl.TEXTURE_2D,null);gl.activeTexture(gl.TEXTURE2);gl.bindTexture(gl.TEXTURE_2D,null);gl.activeTexture(gl.TEXTURE0);
+ gl.enable(gl.DEPTH_TEST);
+}
+
+const WHEELS=[{x:TRACK,z:FZ,front:1,left:0},{x:-TRACK,z:FZ,front:1,left:1},{x:TRACK,z:RZ,front:0,left:0},{x:-TRACK,z:RZ,front:0,left:1}];
+// Independent damped suspension travel for each wheel.
+const suspension=WHEELS.map(()=>({x:0,v:0}));
+// Render-only sprung-mass filters: keep the visible chassis and each wheel moving with
+// damped spring motion when the fixed-step physics solver makes contact corrections.
+const suspensionVisual=WHEELS.map(()=>({x:0,v:0}));
+const rideHeightVisual={x:.12,v:0,ready:false};
+let suspensionFrameDt=1/60;
+function dampedVisualSpring(state,target,dt,frequency=9,damping=1){
+ const h=Math.min(Math.max(dt,1/240),1/30),omega=frequency*2*Math.PI;
+ const a=(target-state.x)*omega*omega-2*damping*omega*state.v;
+ state.v+=a*h;state.x+=state.v*h;
+ if(!Number.isFinite(state.x)||!Number.isFinite(state.v)){state.x=target;state.v=0;}
+ return state.x;
+}
+function matFrom(P,x,y,z){return new Float32Array([P[0],P[1],P[2],0,P[3],P[4],P[5],0,P[6],P[7],P[8],0,x,y,z,1]);}
+function bindMesh(m){gl.bindBuffer(gl.ARRAY_BUFFER,m.buf);gl.vertexAttribPointer(0,3,gl.FLOAT,false,40,0);gl.vertexAttribPointer(2,3,gl.FLOAT,false,40,12);gl.vertexAttribPointer(1,3,gl.FLOAT,false,40,24);gl.vertexAttribPointer(3,1,gl.FLOAT,false,40,36);}
+function drawCar(vp,sh){
+ // Each wheel follows its own suspension target with a damped spring, not a direct snap.
+ for(let i=0;i<WHEELS.length;i++) dampedVisualSpring(suspensionVisual[i],suspension[i].x,suspensionFrameDt,7.5,1.05);
+ const drawY=rapierReady&&Number.isFinite(car.renderY)?car.renderY:car.y;
+ const U=sh?su:cu;gl.useProgram(sh?shadowProg:carProg);gl.uniformMatrix4fv(U.vp,false,vp);if(!sh){gl.uniform3f(cu.cam,camPos[0],camPos[1],camPos[2]);gl.uniform1f(cu.brake,car.brakeLit?1:0);gl.uniformMatrix4fv(cu.lvp,false,lightVP);gl.uniform1i(cu.sh,1);gl.uniform1f(cu.shOn,shOK?1:0);gl.uniform1f(cu.texel,1/SM);}
+ gl.enableVertexAttribArray(2);gl.enableVertexAttribArray(3);
+ const R=mul3(mul3(rotY(car.yaw),rotX(car.pitch)),rotZ(car.roll));
+ bindMesh(bodyMesh);if(!sh)gl.uniform1f(cu.ao,1);gl.uniformMatrix4fv(U.model,false,matFrom(mul3(mul3(R,rotX(car.visPitch||0)),rotZ(car.visRoll||0)),car.x,drawY,car.z));gl.drawArrays(gl.TRIANGLES,0,bodyMesh.count);
+ bindMesh(wheelMesh);if(!sh)gl.uniform1f(cu.ao,0);
+ for(let wi=0;wi<WHEELS.length;wi++){
+  const w=WHEELS[wi];
+  let Rw=R;if(w.front)Rw=mul3(Rw,rotY(rapierReady?car.steer:-car.steer));if(w.left)Rw=mul3(Rw,rotY(Math.PI));
+  const spin=w.front?car.spinF:car.spinR;Rw=mul3(Rw,rotX(w.left?spin:-spin));
+  gl.uniformMatrix4fv(U.model,false,matFrom(Rw,car.x+R[0]*w.x+R[6]*w.z+R[3]*suspensionVisual[wi].x,drawY+R[1]*w.x+R[7]*w.z+R[4]*suspensionVisual[wi].x,car.z+R[2]*w.x+R[8]*w.z+R[5]*suspensionVisual[wi].x));
+  gl.drawArrays(gl.TRIANGLES,0,wheelMesh.count);
+ }
+ gl.disableVertexAttribArray(2);gl.disableVertexAttribArray(3);gl.useProgram(program);
+}
+function perspective(fov,aspect,near,far){const f=1/Math.tan(fov/2),nf=1/(near-far);return new Float32Array([f/aspect,0,0,0,0,f,0,0,0,0,(far+near)*nf,-1,0,0,2*far*near*nf,0]);}
+function viewMatrix(){
+ let x=player.x,y=player.y-landDip,z=player.z,lookYaw=yaw,lookPitch=pitch;
+ if(car.occupied){
+   // Orbit yaw is unrestricted; pitch is clamped to avoid crossing the poles.
+   const distance=7.5, targetY=car.y+.55;
+   x=car.x+Math.sin(driveOrbitYaw)*Math.cos(driveOrbitPitch)*distance;
+   y=targetY+Math.sin(-driveOrbitPitch)*distance;
+   z=car.z+Math.cos(driveOrbitYaw)*Math.cos(driveOrbitPitch)*distance;
+   const dx=car.x-x,dy=targetY-y,dz=car.z-z;
+   const len=Math.hypot(dx,dy,dz)||1;
+   const fx=dx/len,fy=dy/len,fz=dz/len;
+   let rx=-fz,ry=0,rz=fx;const rl=Math.hypot(rx,ry,rz)||1;rx/=rl;ry/=rl;rz/=rl;
+   const ux=ry*fz-rz*fy,uy=rz*fx-rx*fz,uz=rx*fy-ry*fx;
+   camPos[0]=x;camPos[1]=y;camPos[2]=z;return new Float32Array([rx,ux,-fx,0,ry,uy,-fy,0,rz,uz,-fz,0,-(rx*x+ry*y+rz*z),-(ux*x+uy*y+uz*z),fx*x+fy*y+fz*z,1]);
+ }
+ const cp=Math.cos(lookPitch),sp=Math.sin(lookPitch);
+ const fx=-Math.sin(lookYaw)*cp,fy=sp,fz=-Math.cos(lookYaw)*cp;
+ let rx=-fz,ry=0,rz=fx;const rlen=Math.hypot(rx,ry,rz)||1;rx/=rlen;ry/=rlen;rz/=rlen;
+ const ux=ry*fz-rz*fy,uy=rz*fx-rx*fz,uz=rx*fy-ry*fx;
+   camPos[0]=x;camPos[1]=y;camPos[2]=z;return new Float32Array([rx,ux,-fx,0,ry,uy,-fy,0,rz,uz,-fz,0,-(rx*x+ry*y+rz*z),-(ux*x+uy*y+uz*z),fx*x+fy*y+fz*z,1]);
+}
+function multiply(a,b){const out=new Float32Array(16);for(let c=0;c<4;c++)for(let r=0;r<4;r++)out[c*4+r]=a[r]*b[c*4]+a[4+r]*b[c*4+1]+a[8+r]*b[c*4+2]+a[12+r]*b[c*4+3];return out;}
+function resize(){const dpr=Math.min(window.devicePixelRatio||1,1.5),w=Math.max(1,Math.floor(innerWidth*dpr)),h=Math.max(1,Math.floor(innerHeight*dpr));if(canvas.width!==w||canvas.height!==h){canvas.width=w;canvas.height=h;gl.viewport(0,0,w,h);}}
+function collides(x,z,r=player.r){if(Math.abs(x)+r>WORLD||Math.abs(z)+r>WORLD)return true;for(const o of solids){if(x+r>o.x-o.w/2&&x-r<o.x+o.w/2&&z+r>o.z-o.d/2&&z-r<o.z+o.d/2)return true;}return false;}
+function move(dx,dz){const foot=player.y-1.7;let nx=player.x+dx;if(!collides(nx,player.z)&&rampHeightAt(nx,player.z)-foot<.6)player.x=nx;let nz=player.z+dz;if(!collides(player.x,nz)&&rampHeightAt(player.x,nz)-foot<.6)player.z=nz;}
+// ---------------- Car physics ----------------
+// Dynamic bicycle model: body-frame velocity (vl forward, vr right) and yaw rate w (right turn = +).
+// Slip-angle tyre forces with saturation, load transfer, friction ellipse, rear-wheel drive with a
+// power-limited engine, ABS-style braking, aero drag, and rigid-body collisions with impulses.
+const CAR={m:1200,Iz:2000,a:1.35,b:1.5,h:.55,g:9.81,mu:1,P:70000,Fmax:7000,Fbrake:12000,kd:1.0,R:.95,off:1.25};
+const obstacles=solids.concat([
+ {x:WORLD+10,z:0,w:20,d:2*WORLD+60},{x:-WORLD-10,z:0,w:20,d:2*WORLD+60},
+ {x:0,z:WORLD+10,w:2*WORLD+60,d:20},{x:0,z:-WORLD-10,w:2*WORLD+60,d:20}]);
+const clamp=(v,lo,hi)=>Math.max(lo,Math.min(hi,v));
+function tyre(alpha,Fz,mu,scale){return -Fz*mu*scale*Math.sin(1.4*Math.atan(14*alpha));}
+function ellipse(F,Fmax){const r=Math.min(1,Math.abs(F)/Fmax);return Math.max(.25,Math.sqrt(1-r*r));}
+function carStep(h,thr,brk,hb){
+ const k=CAR,L=k.a+k.b,d=car.steer,cd=Math.cos(d),sd=Math.sin(d);
+ let vl=car.vl,vr=car.vr,w=car.w;
+ // Static load plus longitudinal load transfer
+ const Fzf=Math.max(700,k.m*(k.g*k.b-k.h*car.aL)/L),Fzr=Math.max(700,k.m*(k.g*k.a+k.h*car.aL)/L);
+ const sgn=clamp(vl/.5,-1,1);
+ let drive=0;
+ if(car.thrS>0)drive=car.thrS*Math.min(k.Fmax,k.P/Math.max(vl,1));
+ else if(car.thrS<0)drive=car.thrS*3800*clamp((10+vl)/3,0,1);
+ const Fb=brk*k.Fbrake;
+ let Fxf=-sgn*Fb*.65,Fxr=drive-sgn*Fb*.35-(hb?sgn*.88*k.mu*Fzr:0);
+ const Fxfm=k.mu*Fzf,Fxrm=k.mu*Fzr;
+ Fxf=clamp(Fxf,-Fxfm,Fxfm);Fxr=clamp(Fxr,-Fxrm,Fxrm);
+ // Friction ellipse: using grip for braking/accelerating leaves less for cornering
+ const sf=ellipse(Fxf,Fxfm),sr=ellipse(Fxr,Fxrm)*(hb?.8:1);
+ // Slip angles
+ const vfy=vr+k.a*w,vwl=vl*cd+vfy*sd,vwt=vfy*cd-vl*sd;
+ const af=Math.atan2(vwt,Math.max(Math.abs(vwl),2.5)),ar=Math.atan2(vr-k.b*w,Math.max(Math.abs(vl),2.5));
+ const Fyf=tyre(af,Fzf,k.mu,sf),Fyr=tyre(ar,Fzr,k.mu,sr);
+ const sp=Math.hypot(vl,vr);
+ const Fl=Fxf*cd-Fyf*sd+Fxr-k.kd*sp*vl,Fr=Fxf*sd+Fyf*cd+Fyr-k.kd*sp*vr;
+ const torque=k.a*(Fxf*sd+Fyf*cd)-k.b*Fyr;
+ const bl=Math.min(1,h*10);car.aL+=(Fl/k.m-car.aL)*bl;car.aR+=(Fr/k.m-car.aR)*bl;
+ const vl0=vl;
+ vl+=(Fl/k.m+vr*w)*h;vr+=(Fr/k.m-vl0*w)*h;w+=(torque/k.Iz-w*.4)*h;
+ // Rolling resistance and engine braking (never reverse the direction of travel)
+ const res=(.15+(thr===0&&brk===0?.7:0))*h;
+ vl-=Math.sign(vl)*Math.min(Math.abs(vl),res);
+ if(brk>0&&thr===0&&vl0*vl<0)vl=0;
+ if(thr===0&&Math.abs(vl)<.05&&Math.abs(vr)<.05&&Math.abs(w)<.05){vl=0;vr=0;w=0;}
+ car.yaw-=w*h;
+ const s=Math.sin(car.yaw),c=Math.cos(car.yaw);
+ car.x+=(-s*vl+c*vr)*h;car.z+=(-c*vl-s*vr)*h;
+ car.vl=vl;car.vr=vr;car.w=w;
+ carCollide();
+}
+// Two circles (front/rear) against axis-aligned boxes, resolved with normal + friction impulses.
+function carCollide(){
+ // Oriented-box vs axis-aligned-box SAT. Unlike the old two-circle approximation,
+ // this checks the full car footprint, including side and corner impacts.
+ const k=CAR,halfL=2.35,halfW=.98;
+ const fx=-Math.sin(car.yaw),fz=-Math.cos(car.yaw),rx=Math.cos(car.yaw),rz=-Math.sin(car.yaw);
+ let vx=-Math.sin(car.yaw)*car.vl+Math.cos(car.yaw)*car.vr;
+ let vz=-Math.cos(car.yaw)*car.vl-Math.sin(car.yaw)*car.vr;
+ let wy=-car.w;
+ for(let pass=0;pass<3;pass++){
+  let corrected=false;
+  for(const o of obstacles){
+   // For real scene boxes, ignore the horizontal footprint when the car is clearly above
+   // or below the obstacle. World-boundary walls intentionally remain infinitely tall.
+   if(Number.isFinite(o.y)&&Number.isFinite(o.h)){
+    const obstacleBottom=o.y-o.h*.5,obstacleTop=o.y+o.h*.5;
+    const carBottom=car.y+.18,carTop=car.y+1.48;
+    if(carTop<obstacleBottom||carBottom>obstacleTop)continue;
+   }
+   const dx=car.x-o.x,dz=car.z-o.z,ohx=o.w*.5,ohz=o.d*.5;
+   const axes=[[1,0],[0,1],[fx,fz],[rx,rz]];
+   let minPen=Infinity,bnx=0,bnz=0,separated=false;
+   for(const [ax,az] of axes){
+    const carR=halfL*Math.abs(ax*fx+az*fz)+halfW*Math.abs(ax*rx+az*rz);
+    const obsR=ohx*Math.abs(ax)+ohz*Math.abs(az);
+    const signed=dx*ax+dz*az,pen=carR+obsR-Math.abs(signed);
+    if(pen<=0){separated=true;break;}
+    if(pen<minPen){minPen=pen;const sign=signed>=0?1:-1;bnx=ax*sign;bnz=az*sign;}
+   }
+   if(separated)continue;
+   // Small positional correction prevents penetration; the contact impulse handles impact speed and spin.
+   const correction=Math.max(0,minPen-.002)*.82;
+   car.x+=bnx*correction;car.z+=bnz*correction;corrected=true;
+   // Approximate the contact point on the nearest front/side edge for angular response.
+   const along=clamp((o.x-car.x)*fx+(o.z-car.z)*fz,-halfL,halfL);
+   const across=clamp((o.x-car.x)*rx+(o.z-car.z)*rz,-halfW,halfW);
+   const px=car.x+fx*along+rx*across, pz=car.z+fz*along+rz*across;
+   const crx=px-car.x,crz=pz-car.z;
+   const pvx=vx+wy*crz,pvz=vz-wy*crx;
+   const vn=pvx*bnx+pvz*bnz;
+   if(vn<0){
+    const cross=crz*bnx-crx*bnz;
+    const denom=1/k.m+(cross*cross)/k.Iz;
+    const j=-(1+.025)*vn/denom;
+    vx+=j*bnx/k.m;vz+=j*bnz/k.m;wy+=j*cross/k.Iz;
+    // Coulomb-like tangential friction impulse, limited by normal impulse.
+    const tx=-bnz,tz=bnx,vt=pvx*tx+pvz*tz,ct=crz*tx-crx*tz;
+    const jt=clamp(-vt/(1/k.m+ct*ct/k.Iz),-.42*j,.42*j);
+    vx+=jt*tx/k.m;vz+=jt*tz/k.m;wy+=jt*ct/k.Iz;
+   }
+  }
+  if(!corrected)break;
+ }
+ // Convert world velocity back into the car's body frame.
+ const s=Math.sin(car.yaw),c=Math.cos(car.yaw);
+ car.vl=-s*vx-c*vz;car.vr=c*vx-s*vz;car.w=-wy;
+ // Keep the whole vehicle inside the world bounds.
+ const margin=halfW+.1;car.x=clamp(car.x,-WORLD+margin,WORLD-margin);car.z=clamp(car.z,-WORLD+margin,WORLD-margin);
+}
+// Wheel/tire collision against solid 3D boxes. Tires are conservative spheres for robust contact.
+// The response moves the vehicle out of the obstacle and removes inward velocity.
+function resolveWheelObstacleContacts(){
+ const tireR=.36,fx=-Math.sin(car.yaw),fz=-Math.cos(car.yaw),rx=Math.cos(car.yaw),rz=-Math.sin(car.yaw);
+ let pushX=0,pushZ=0,pushCount=0;
+ for(let wi=0;wi<WHEELS.length;wi++){
+  const wh=WHEELS[wi],wx=car.x+fx*wh.z+rx*wh.x,wz=car.z+fz*wh.z+rz*wh.x;
+  const wy=car.y+groundAnchorY(wh)+suspension[wi].x;
+  for(const o of solids){
+   const minY=o.y-o.h/2,maxY=o.y+o.h/2;
+   if(wy+tireR<minY||wy-tireR>maxY)continue;
+   const qx=clamp(wx,o.x-o.w/2,o.x+o.w/2),qz=clamp(wz,o.z-o.d/2,o.z+o.d/2);
+   let dx=wx-qx,dz=wz-qz,dist=Math.hypot(dx,dz);
+   if(dist<tireR){
+    if(dist<1e-5){const px=o.w/2-Math.abs(wx-o.x),pz=o.d/2-Math.abs(wz-o.z);if(px<pz){dx=wx>=o.x?1:-1;dz=0;dist=1;}else{dx=0;dz=wz>=o.z?1:-1;dist=1;}}
+    const nx=dx/dist,nz=dz/dist,depth=tireR-dist;
+    pushX+=nx*(depth+.002);pushZ+=nz*(depth+.002);pushCount++;
+    const vx=-Math.sin(car.yaw)*car.vl+Math.cos(car.yaw)*car.vr,vz=-Math.cos(car.yaw)*car.vl-Math.sin(car.yaw)*car.vr;
+    const vn=vx*nx+vz*nz;if(vn<0){const nvx=vx-vn*nx,nvz=vz-vn*nz;const outx=nvx+nx*(-vn*.12),outz=nvz+nz*(-vn*.12);const ss=Math.sin(car.yaw),cc=Math.cos(car.yaw);car.vl=-ss*outx-cc*outz;car.vr=cc*outx-ss*outz;}
+   }
+  }
+ }
+ if(pushCount){car.x+=pushX/Math.max(1,pushCount);car.z+=pushZ/Math.max(1,pushCount);}
+}
+function groundAnchorY(wh){const R=mul3(mul3(rotY(car.yaw),rotX(car.pitch)),rotZ(car.roll));return R[1]*wh.x+R[7]*wh.z;}
+function stepCar(dt){
+ if(rapierReady){stepRapierCar(dt);return;}
+ let thr=0,brk=0,hb=false,steerIn=0;
+ if(car.occupied){
+  const up=keys.has('KeyW')||keys.has('ArrowUp'),dn=keys.has('KeyS')||keys.has('ArrowDown');
+  if(up&&!dn){if(car.vl<-.5)brk=1;else thr=1;}
+  else if(dn&&!up){if(car.vl>.5)brk=1;else thr=-1;}
+  steerIn=(keys.has('KeyD')||keys.has('ArrowRight')?1:0)-(keys.has('KeyA')||keys.has('ArrowLeft')?1:0);
+  hb=keys.has('Space');
+ }else{brk=1;hb=true;} // parking brake when nobody is driving
+ // Speed-sensitive steering lock, plus a mild counter-steer assist for keyboard play
+ const sp=Math.abs(car.vl),maxSteer=.6/(1+(sp/9)*(sp/9));
+ let target=steerIn*maxSteer;
+ if(car.occupied&&car.vl>3)target+=clamp(Math.atan2(car.vr,car.vl)*.5,-.3,.3);
+ target=clamp(target,-.62,.62);
+ car.steer+=(target-car.steer)*Math.min(1,dt*(steerIn?6:10));
+ if(thr===0)car.thrS=0;else car.thrS+=clamp(thr-car.thrS,-dt*5,dt*5);
+ const n=Math.max(1,Math.ceil(dt*240)),h=dt/n;
+ if(car.air){ // airborne: no tyre grip, momentum carries on (only light air drag)
+  const sa=Math.sin(car.yaw),ca=Math.cos(car.yaw),dr=Math.max(0,1-.012*dt*Math.hypot(car.vl,car.vr));
+  car.vl*=dr;car.vr*=dr;
+  car.x+=(-sa*car.vl+ca*car.vr)*dt;car.z+=(-ca*car.vl-sa*car.vr)*dt;car.yaw-=car.w*dt;car.aL*=.9;car.aR*=.9;carCollide();
+ }else for(let i=0;i<n;i++)carStep(h,thr,brk,hb);
+ car.spinF+=car.vl*dt/GY;if(!hb)car.spinR+=car.vl*dt/GY;
+ car.brakeLit=car.occupied&&(brk>0||hb);
+ // Four-wheel spring suspension with hard non-penetration constraints against the heightfield.
+ // Each wheel has its own contact height; chassis height is solved from all four supports.
+ const fx=-Math.sin(car.yaw),fz=-Math.cos(car.yaw),rightX=Math.cos(car.yaw),rightZ=-Math.sin(car.yaw);
+ const centerTerrain=surfaceHeight(car.x,car.z),R=mul3(mul3(rotY(car.yaw),rotX(car.pitch)),rotZ(car.roll));
+ const wheelGround=[],anchorY=[];
+ for(let i=0;i<WHEELS.length;i++){
+  const wh=WHEELS[i],sx=car.x+fx*wh.z+rightX*wh.x,sz=car.z+fz*wh.z+rightZ*wh.x;
+  wheelGround[i]=wheelContactHeight(sx,sz,.36);
+  anchorY[i]=R[1]*wh.x+R[7]*wh.z;
+ }
+ // Advanced fallback suspension: axle anti-roll coupling, progressive bump stops, and
+ // separate compression/rebound damping. Wheel order is front-left, front-right,
+ // rear-left, rear-right, so each wheel can react independently to bumps.
+ const suspTargets=WHEELS.map((wh,i)=>{
+  const load=(wh.front?car.aL:-car.aL)*.008+(wh.left?car.aR:-car.aR)*.006;
+  return car.air?-.16:clamp(wheelGround[i]-centerTerrain+load,-.48,.48);
+ });
+ for(const axle of [[0,1,.22],[2,3,.17]]){
+  const [li,ri,bar]=axle,dl=suspTargets[li]-suspTargets[ri];
+  suspTargets[li]-=dl*bar;suspTargets[ri]+=dl*bar;
+ }
+ for(let i=0;i<WHEELS.length;i++){
+  const target=suspTargets[i],spn=suspension[i],err=target-spn.x;
+  const compression=spn.v>0;
+  const travel=clamp(Math.abs(spn.x)/.46,0,1);
+  const springRate=105+travel*95; // progressive spring near the bump/rebound limits
+  const damper=compression?25:20; // firmer compression control; slightly softer rebound
+  const bump=spn.x>.36?-Math.pow((spn.x-.36)/.12,2)*180:0;
+  const droop=spn.x<-.39?Math.pow((-spn.x-.39)/.11,2)*100:0;
+  const accel=err*springRate-spn.v*damper+bump+droop;
+  spn.v=clamp(spn.v+accel*dt,-5.5,5.5);spn.x=clamp(spn.x+spn.v*dt,-.5,.5);
+ }
+ // Let the chassis follow the mean wheel support height with vertical inertia.
+ // Real gravity: the chassis is a free-falling body (9.81 m/s^2) that the ground pushes back on.
+ // It leaves the ground over crests and ramp lips and lands with an impact that kicks the suspension.
+ let baseTarget=0;
+ for(let i=0;i<WHEELS.length;i++)baseTarget+=wheelGround[i]+.36-anchorY[i];
+ baseTarget/=WHEELS.length;
+ const gVy=(baseTarget-(car.gT===undefined?baseTarget:car.gT))/Math.max(dt,1e-4);car.gT=baseTarget;
+ car.vy-=G*dt;car.y+=car.vy*dt;
+ if(car.y<=baseTarget){
+  const impact=car.air?-(car.vy-gVy):0;
+  if(impact>1.5)for(const sp of suspension)sp.v+=Math.min(impact,9)*.55;
+  car.y=baseTarget;car.vy=Math.max(car.vy,clamp(gVy,-30,30));
+ }
+ car.air=car.y>baseTarget+.05;
+ // Hard wheel-ground contact: suspension may compress, but tire geometry may not pass through terrain.
+ for(let i=0;i<WHEELS.length;i++){
+  const minTravel=wheelGround[i]+.36-(car.y+anchorY[i]);
+  if(suspension[i].x<minTravel){suspension[i].x=minTravel;suspension[i].v=Math.max(0,suspension[i].v);}
+ }
+ // Prevent the chassis underside from crossing the terrain between the wheels.
+ const chassisFloor=chassisSupportHeight(car.x,car.z,car.yaw,car.pitch,car.roll)+.045;
+ if(car.y<chassisFloor){car.y=chassisFloor;if(car.vy<0)car.vy=0;}
+ // Re-check tire bottoms after chassis correction; this is a hard unilateral contact constraint.
+ for(let i=0;i<WHEELS.length;i++){
+  const wh=WHEELS[i],sx=car.x+fx*wh.z+rightX*wh.x,sz=car.z+fz*wh.z+rightZ*wh.x;
+  const Rw=mul3(mul3(rotY(car.yaw),rotX(car.pitch)),rotZ(car.roll));
+  const axleY=car.y+Rw[1]*wh.x+Rw[7]*wh.z;
+  const minSusp=wheelContactHeight(sx,sz,.36)+.36-axleY;
+  if(suspension[i].x<minSusp){suspension[i].x=minSusp;suspension[i].v=Math.max(0,suspension[i].v);}
+ }
+ const frontH=(wheelGround[0]+wheelGround[1])*.5,rearH=(wheelGround[2]+wheelGround[3])*.5;
+ const rightH=(wheelGround[0]+wheelGround[2])*.5,leftH=(wheelGround[1]+wheelGround[3])*.5;
+ const terrainPitch=clamp(Math.atan2(frontH-rearH,Math.abs(FZ-RZ)),-.22,.22);
+ const terrainRoll=clamp(Math.atan2(rightH-leftH,TRACK*2),-.20,.20);
+ const tp=car.air?clamp(Math.atan2(car.vy,Math.max(Math.abs(car.vl),4)),-.5,.5):clamp(terrainPitch+car.aL*.004,-.25,.25),tr=car.air?0:clamp(terrainRoll+car.aR*.003,-.22,.22),kS=car.air?7:38,kD=car.air?3.5:10;
+ car.pitchV+=((tp-car.pitch)*kS-car.pitchV*kD)*dt;car.pitch+=car.pitchV*dt;
+ car.rollV+=((tr-car.roll)*kS-car.rollV*kD)*dt;car.roll+=car.rollV*dt;
+ resolveWheelObstacleContacts();
+ car.speed=car.vl;
+}
+// ---------------- Rapier rigid-body vehicle physics ----------------
+// The renderer remains native WebGL. Rapier owns the chassis, terrain, obstacle contacts,
+// gravity, angular response, and the four raycast suspension wheels.
+let RAPIER=null, rapierWorld=null, rapierCarBody=null, rapierVehicle=null, rapierReady=false;
+let rapierAccumulator=0, rapierInitError='', rapPrev=null, rapCur=null;   // rapPrev/rapCur: last two physics states, for render interpolation
+const RAP_STEP=1/120;
+async function initRapierPhysics(){
+ try{
+  const mod=await import('https://cdn.jsdelivr.net/npm/@dimforge/rapier3d-compat@0.19.3/+esm');
+  RAPIER=mod.default||mod;
+  await RAPIER.init();
+  rapierWorld=new RAPIER.World({x:0,y:-G,z:0});
+  rapierWorld.timestep=RAP_STEP;
+  // Terrain mesh follows the exact same height function used by the renderer.
+  const N=141, step=1.5, startAt=-105, verts=new Float32Array(N*N*3), inds=new Uint32Array((N-1)*(N-1)*6);
+  let vi=0;
+  for(let iz=0;iz<N;iz++)for(let ix=0;ix<N;ix++){
+   const x=startAt+ix*step,z=startAt+iz*step;verts[vi++]=x;verts[vi++]=groundHeight(x,z);verts[vi++]=z;
+  }
+  let ii=0;
+  for(let iz=0;iz<N-1;iz++)for(let ix=0;ix<N-1;ix++){
+   const a=iz*N+ix,b=a+1,c=a+N+1,d=a+N;
+   inds[ii++]=a;inds[ii++]=c;inds[ii++]=b;inds[ii++]=a;inds[ii++]=d;inds[ii++]=c;
+  }
+  const groundBody=rapierWorld.createRigidBody(RAPIER.RigidBodyDesc.fixed().setTranslation(0,0,0));
+  // Keep the collider at world origin: its vertices use the same world X/Z coordinates and
+  // groundHeight() samples as the visible terrain. A small contact margin prevents seams.
+  rapierWorld.createCollider(RAPIER.ColliderDesc.trimesh(verts,inds).setFriction(1.05).setRestitution(.005).setActiveCollisionTypes(RAPIER.ActiveCollisionTypes.DEFAULT),groundBody);
+  // Each rendered obstacle receives a matching static cuboid collider at the same transform.
+  for(const o of solids){
+   const b=rapierWorld.createRigidBody(RAPIER.RigidBodyDesc.fixed().setTranslation(o.x,o.y,o.z).setRotation({x:0,y:Math.sin((o.yaw||0)/2),z:0,w:Math.cos((o.yaw||0)/2)}));
+   rapierWorld.createCollider(RAPIER.ColliderDesc.cuboid(o.w/2,o.h/2,o.d/2).setFriction(.8).setRestitution(.01),b);
+  }
+  // Fixed boundary colliders.
+  const edgeDefs=[{x:WORLD+1,y:3,z:0,hx:1,hy:8,hz:WORLD+5},{x:-WORLD-1,y:3,z:0,hx:1,hy:8,hz:WORLD+5},{x:0,y:3,z:WORLD+1,hx:WORLD+5,hy:8,hz:1},{x:0,y:3,z:-WORLD-1,hx:WORLD+5,hy:8,hz:1}];
+  for(const o of edgeDefs){const b=rapierWorld.createRigidBody(RAPIER.RigidBodyDesc.fixed().setTranslation(o.x,o.y,o.z));rapierWorld.createCollider(RAPIER.ColliderDesc.cuboid(o.hx,o.hy,o.hz),b);}
+  // The rigid-body origin is the chassis center, slightly above the visible car's ground origin.
+  for(const r of RAMPS){
+   const hw=r.w/2,hl=r.l/2,b=-.6,pts=new Float32Array([-hw,b,hl, hw,b,hl, hw,b,-hl, -hw,b,-hl, -hw,0,hl, hw,0,hl, hw,r.h,-hl, -hw,r.h,-hl]);
+   const rb=rapierWorld.createRigidBody(RAPIER.RigidBodyDesc.fixed().setTranslation(r.x,0,r.z).setRotation({x:0,y:Math.sin(r.yaw/2),z:0,w:Math.cos(r.yaw/2)}));
+   const cd=RAPIER.ColliderDesc.convexHull(pts);
+   if(cd)rapierWorld.createCollider(cd.setFriction(.9).setRestitution(.005),rb);
+  }
+  const spawnY=groundHeight(car.x,car.z)+.78;
+  const bodyDesc=RAPIER.RigidBodyDesc.dynamic().setTranslation(car.x,spawnY,car.z).setRotation({x:0,y:Math.sin(car.yaw/2),z:0,w:Math.cos(car.yaw/2)}).setLinvel(-Math.sin(car.yaw)*car.vl+Math.cos(car.yaw)*car.vr,0,-Math.cos(car.yaw)*car.vl-Math.sin(car.yaw)*car.vr).setAngvel({x:0,y:-car.w,z:0}).setCanSleep(false).setCcdEnabled(true).setLinearDamping(.015).setAngularDamping(.025);
+  rapierCarBody=rapierWorld.createRigidBody(bodyDesc);
+  // Chassis made of two boxes: a lower box with a raised belly that ends before the bumpers, and a thin upper
+ // slab spanning the full length. The nose/tail underside is tucked up so ramps don't snag it. Total mass ~1500 kg.
+ rapierWorld.createCollider(RAPIER.ColliderDesc.cuboid(.96,.31,1.75).setTranslation(0,.03,0).setDensity(222*HM.fMass/1500).setFriction(.6).setRestitution(.005),rapierCarBody);
+ rapierWorld.createCollider(RAPIER.ColliderDesc.cuboid(.96,.145,2.3).setTranslation(0,.195,0).setDensity(222*HM.fMass/1500).setFriction(.6).setRestitution(.005),rapierCarBody);
+  rapierWorld.createCollider(RAPIER.ColliderDesc.cuboid(.7,.19,.8).setTranslation(0,.53,.4).setDensity(1).setFriction(.6).setRestitution(.005),rapierCarBody);
+  rapierVehicle=rapierWorld.createVehicleController(rapierCarBody);
+  // Wheel order matches WHEELS: front-left, front-right, rear-left, rear-right.
+  for(const wh of WHEELS){
+   rapierVehicle.addWheel({x:wh.x,y:-.22,z:wh.z},{x:0,y:-1,z:0},{x:1,y:0,z:0},.2,.36);
+  }
+  for(let i=0;i<4;i++){
+   // Advanced road-car suspension: slightly firmer front springs, controlled bump
+   // compression, faster rebound recovery, longer wheel travel, and adequate force
+   // reserve for landings. Rapier scales stiffness against chassis mass internally.
+   const front=i<2;
+   rapierVehicle.setWheelSuspensionStiffness(i,front?28:25);
+   rapierVehicle.setWheelSuspensionCompression(i,front?2.65:2.45);
+   rapierVehicle.setWheelSuspensionRelaxation(i,3.65);
+   rapierVehicle.setWheelFrictionSlip(i,1.7);   // Rapier friction slip caps combined forward/lateral impulse
+   rapierVehicle.setWheelMaxSuspensionTravel(i,.38);
+   rapierVehicle.setWheelMaxSuspensionForce(i,36000);
+  }
+  // Vehicle forward is local -Z for this model; up remains +Y.
+  if(typeof rapierVehicle.setIndexForwardAxis==='function')rapierVehicle.setIndexForwardAxis(2);
+  if(typeof rapierVehicle.setIndexUpAxis==='function')rapierVehicle.setIndexUpAxis(1);
+  rapierReady=true;
+  stats.textContent='Rapier physics ready · rigid chassis + terrain mesh + 4 suspension wheels';
+ }catch(err){
+  rapierInitError=String(err&&err.message||err);
+  stats.textContent='Rapier failed to load · '+rapierInitError;
+  error.textContent='Could not load the Rapier physics engine. Check your internet connection, or open this HTML through a local web server. '+rapierInitError;
+ }
+}
+// Crash feel. Bigger spin = the car swings around whatever it hits; bigger rebound = it bounces off more.
+// Real-world crash constants (NHTSA / SAE barrier-test data):
+// e0+e1*exp(-v/eS): restitution ~0.4 at a bumper tap, ~0.18 at 18 km/h, ~0.07 at 55 km/h (tests: 0.03-0.2 at speed, up to ~0.33+ when slow)
+// b0: no-damage threshold ~8 km/h; k: residual crush per m/s above it (~0.5 m at 56 km/h); t0+t1*v: pulse length (~105 ms at 56 km/h, ~26 g peak)
+// Rollover: tyres dig in above ~25 km/h sideways slide (soil/rim trip); roof has only ~16 cm of crush space; engines cut oil/fuel feed when inverted.
+const RO={digV:7,digMu:.85,roofRoom:.16,roofK:1.5,stallUp:-.3,stallT:.6};
+const CR={e0:.05,e1:.35,eS:5,b0:2.2,k:.037,t0:.065,t1:.0025,room:{front:.6,rear:.5,side:.25}};   // room = crush space in metres before the cabin is reached
+// ---- Powertrain (rear-wheel drive, 6-speed automatic) ----
+const GEARS=[0,3.6,2.4,1.7,1.3,1.0,.82],FINAL=3.7,WR=.36,IDLE=900,REDLINE=6500,BRAKE_TOTAL=120;   // BRAKE_TOTAL ~ 1 g for this mass at 120 Hz
+const PT={gear:1,rpm:IDLE,shift:0,rev:false};
+// ---- GTA V style handling.meta ----
+// Rockstar's engine code is not public. These are the real handling.meta field names and the behaviour the modding
+// community has documented for them (gear speeds spread up to a top speed set by fInitialDriveMaxFlatVel, drive force
+// tapering to zero at each gear's limit, traction that peaks at a slip angle then falls to a minimum, and extra
+// traction loss at low speed under throttle). The numbers below are a typical sports coupe.
+const HM={fMass:2200,fInitialDragCoeff:10,fDriveBiasFront:0,nInitialDriveGears:6,fInitialDriveForce:.17,fInitialDriveMaxFlatVel:250,
+ fClutchChangeRateScaleUpShift:2.5,fClutchChangeRateScaleDownShift:2.5,fBrakeForce:1.0,fBrakeBiasFront:.65,fHandBrakeForce:.75,
+ fSteeringLock:38,fTractionCurveMax:2.4,fTractionCurveMin:2.1,fTractionCurveLateral:22.5,fLowSpeedTractionLossMult:1.0,fTractionBiasFront:.49};
+const V_TOP=HM.fInitialDriveMaxFlatVel*.82/3.6;                                   // m/s, in-game top speed is ~0.82 of the flat velocity
+const GFRAC=[0];for(let g=1;g<=HM.nInitialDriveGears;g++)GFRAC.push(Math.pow(g/HM.nInitialDriveGears,.75));  // each gear's max speed as a share of V_TOP
+const DRAG_COEF=HM.fInitialDragCoeff*HM.fMass*3e-5;                                // N per (m/s)^2
+function gtaTraction(slipDeg,driven,pedal,speed){
+ const lat=HM.fTractionCurveLateral;
+ let g=slipDeg<=lat?HM.fTractionCurveMax:HM.fTractionCurveMax+(HM.fTractionCurveMin-HM.fTractionCurveMax)*clamp((slipDeg-lat)/lat,0,1);
+ if(driven)g*=1-.35*HM.fLowSpeedTractionLossMult*clamp(1-speed/9,0,1)*Math.abs(pedal);   // wheelspin when launching hard
+ return g;
+}
+function torqueAt(r){const x=(r-4300)/3200;return 220*Math.max(.35,1-.55*x*x);}   // Nm, broad peak that falls off at the ends
+// ====== Tyre model: Pacejka "Magic Formula" ======
+// Rapier's raycast vehicle only has a simple friction clamp. Here Rapier still provides the springs and dampers (so also the load on each
+// tyre), but the tyre forces use the formulas racing sims use: slip ratio + slip angle -> Magic Formula -> friction circle, with load
+// sensitivity, per-wheel rotation (wheelspin / lock-up / ABS), a limited-slip diff and downforce. Press P to switch back to the GTA handling.
+const TIRE={R:.36,Iw:1.3,mu0:1.12,Fz0:HM.fMass*9.81/4,Bx:12,Cx:1.65,Ex:.2,By:11,Cy:1.4,Ey:-.3,loadSens:.1,rollInf:.35,lsd:120};
+function mf(B,C,E,x){const bx=B*x;return Math.sin(C*Math.atan(bx-E*(bx-Math.atan(bx))));}   // F = D sin(C atan(Bx - E(Bx - atan Bx)))
+function tireForce(vx,vy,w,Fz,mu){
+ const R=TIRE.R,peak=mu*Fz,vden=Math.max(Math.abs(vx),3);
+ const kappa=clamp((w*R-vx)/vden,-1.2,1.2),alpha=Math.atan2(vy,vden);          // slip ratio, slip angle
+ const fxp=peak*mf(TIRE.Bx,TIRE.Cx,TIRE.Ex,kappa),fyp=-peak*mf(TIRE.By,TIRE.Cy,TIRE.Ey,alpha);
+ const fxl=-peak*clamp((vx-w*R)/.6,-1,1),fyl=-peak*clamp(vy/.6,-1,1);           // below ~1 m/s slip angle is ill-defined: stick like static friction
+ const bl=clamp((Math.abs(vx)-1)/3,0,1),b=bl*bl*(3-2*bl);
+ let fx=fxl+(fxp-fxl)*b,fy=fyl+(fyp-fyl)*b;
+ const s=Math.hypot(fx,fy)/Math.max(peak,1);if(s>1){fx/=s;fy/=s;}                // friction circle: grip is shared between braking/driving and cornering
+ return {fx,fy};
+}
+function spinWheel(w,T,Tb,h){w+=h*T/TIRE.Iw;const d=Tb*h/TIRE.Iw;return Math.abs(w)<=d?0:w-Math.sign(w)*d;}
+function pacTires(h){
+ const inp=car.tin;if(!inp)return;
+ car.tcsAct=false;
+ const body=rapierCarBody,m=body.mass(),q=body.rotation(),t=body.translation(),lv=body.linvel(),av=body.angvel(),W=car.wheelW,R=TIRE.R;
+ const T=inp.T.slice();
+ for(const [a,b] of [[0,1],[2,3]]){if(Math.abs(T[a]+T[b])>1){const l=clamp(TIRE.lsd*(W[b]-W[a]),-400,400);T[a]+=l;T[b]-=l;}}   // limited-slip diff
+ for(let i=0;i<4;i++){
+  let on=false,L=.12,Fz=0,n={x:0,y:1,z:0};
+  try{on=rapierVehicle.wheelIsInContact(i);L=rapierVehicle.wheelSuspensionLength(i);}catch(_){}
+  if(!on){W[i]=spinWheel(W[i],T[i],inp.B[i],h);continue;}
+  try{const f=rapierVehicle.wheelSuspensionForce(i);if(Number.isFinite(f))Fz=f;}catch(_){}
+  try{const nn=rapierVehicle.wheelContactNormal(i);if(nn&&Number.isFinite(nn.y)&&nn.y>.3)n=nn;}catch(_){}
+  if(!(Fz>1))Fz=m*G/4;Fz=Math.min(Fz,m*G*1.2);
+  const wh=WHEELS[i],c0=qrot(q,wh.x,-.22,wh.z),dn=qrot(q,0,-(L+R),0);
+  const rel={x:c0.x+dn.x,y:c0.y+dn.y,z:c0.z+dn.z};                              // contact patch relative to the centre of mass
+  const vel={x:lv.x+av.y*rel.z-av.z*rel.y,y:lv.y+av.z*rel.x-av.x*rel.z,z:lv.z+av.x*rel.y-av.y*rel.x};
+  const sd=Math.sin(car.steerW[i]||0),cd=Math.cos(car.steerW[i]||0);
+  let f=qrot(q,-sd,0,-cd);const fn=f.x*n.x+f.y*n.y+f.z*n.z;f={x:f.x-n.x*fn,y:f.y-n.y*fn,z:f.z-n.z*fn};
+  const fl=Math.hypot(f.x,f.y,f.z)||1;f.x/=fl;f.y/=fl;f.z/=fl;
+  const lat={x:f.y*n.z-f.z*n.y,y:f.z*n.x-f.x*n.z,z:f.x*n.y-f.y*n.x};              // wheel's right-hand axis
+  const vx=vel.x*f.x+vel.y*f.y+vel.z*f.z,vy=vel.x*lat.x+vel.y*lat.y+vel.z*lat.z;
+  const mu=TIRE.mu0*clamp(1-TIRE.loadSens*(Fz/TIRE.Fz0-1),.6,1.3)*(1-car.tireDamage*.25)*2*(i<2?HM.fTractionBiasFront:1-HM.fTractionBiasFront);
+  // semi-implicit wheel update: the tyre is extremely stiff, an explicit step would oscillate
+  const f0=tireForce(vx,vy,W[i],Fz,mu).fx,f1=tireForce(vx,vy,W[i]+1,Fz,mu).fx,k=Math.max(0,f1-f0);
+  // Traction control (Forza-style TCS): cut drive torque on a wheel once its slip ratio passes ~12 %, fully by ~22 %
+  let Ti=T[i];
+  if(car.tcs&&Ti!==0){const kap=(W[i]*R-vx)/Math.max(Math.abs(vx),3);if(kap*Ti>0){const c=clamp(1-(Math.abs(kap)-.12)/.1,.05,1);if(c<1)car.tcsAct=true;Ti*=c;}}
+  let w=W[i]+h/TIRE.Iw*(Ti-R*f0)/(1+h*R*k/TIRE.Iw);
+  let Tb=inp.B[i];
+  if(inp.abs){const kap=(W[i]*R-vx)/Math.max(Math.abs(vx),3);Tb*=clamp(1-(-kap-.14)/.08,.15,1);}   // ABS: ease off when the wheel starts to lock
+  const dB=Tb*h/TIRE.Iw;w=Math.abs(w)<=dB?0:w-Math.sign(w)*dB;
+  W[i]=w;
+  const F=tireForce(vx,vy,w,Fz,mu);
+  const px=t.x+rel.x,py=t.y+rel.y,pz=t.z+rel.z,ly=t.y+rel.y*TIRE.rollInf;           // lateral force acts higher up to limit body roll
+  body.applyImpulseAtPoint({x:f.x*F.fx*h,y:f.y*F.fx*h,z:f.z*F.fx*h},{x:px,y:py,z:pz},true);
+  body.applyImpulseAtPoint({x:lat.x*F.fy*h,y:lat.y*F.fy*h,z:lat.z*F.fy*h},{x:px,y:ly,z:pz},true);
+ }
+}
+// Per-physics-step forces Rapier's raycast vehicle doesn't model: aero drag, rolling resistance, anti-roll bars.
+const ARB=[[0,1,17000],[2,3,11000]];   // [right wheel, left wheel, N per m of compression difference]
+function rapierForces(h){
+ const v=rapierCarBody.linvel(),sp=Math.hypot(v.x,v.y,v.z),spH=Math.hypot(v.x,v.z),m=rapierCarBody.mass();
+ const L=[],on=[];let grounded=0;
+ for(let i=0;i<4;i++){let l=.12,c=false;try{l=rapierVehicle.wheelSuspensionLength(i);c=rapierVehicle.wheelIsInContact(i);}catch(_){}L[i]=l;on[i]=c;if(c)grounded++;}
+ if(sp>.05){
+  const kd=DRAG_COEF*sp*h;                                                   // 0.5*rho*Cd*A*|v|, Cd*A ~ 0.7 m2
+  const kr=grounded&&spH>.3?Math.min(.013*m*G/spH*h,m*.5):0;        // rolling resistance, ~1.3% of weight
+  rapierCarBody.applyImpulse({x:-v.x*(kd+kr),y:-v.y*kd,z:-v.z*(kd+kr)},true);
+  if(car.pac&&grounded)rapierCarBody.applyImpulse({x:0,y:-.35*spH*spH*h,z:0},true);   // aero downforce: more grip at speed
+ }
+ const q=rapierCarBody.rotation(),t=rapierCarBody.translation();
+ const rot=(x,y,z)=>{const tx=2*(q.y*z-q.z*y),ty=2*(q.z*x-q.x*z),tz=2*(q.x*y-q.y*x);return {x:x+q.w*tx+(q.y*tz-q.z*ty),y:y+q.w*ty+(q.z*tx-q.x*tz),z:z+q.w*tz+(q.x*ty-q.y*tx)};};
+ if(car.assistF&&grounded>=2){
+  const f=rot(0,0,-1),l=Math.hypot(f.x,f.z)||1,imp=car.assistF*h/l;
+  rapierCarBody.applyImpulse({x:f.x*imp,y:0,z:f.z*imp},true);
+ }
+ // Stability control (Forza-style STM): compare the yaw rate the steering asks for (bicycle model, limited by grip) with the real one
+ // and apply a corrective yaw torque when the car rotates too much (oversteer) or too little (understeer). Off during handbrake drifts.
+ car.stmAct=false;
+ if(car.stm&&car.occupied&&grounded>=3&&spH>8&&(car.driftBlend||0)<.15){
+  const w=rapierCarBody.angvel(),Lb=Math.abs(FZ-RZ),lim=.95*TIRE.mu0*G/Math.max(spH,1);
+  const des=clamp(car.vl*Math.tan(car.steer)/Lb,-lim,lim),err=w.y-des,dead=.18;
+  if(Math.abs(err)>dead){rapierCarBody.applyTorqueImpulse({x:0,y:-(err-Math.sign(err)*dead)*m*3.2*2.2*h,z:0},true);car.stmAct=true;}
+ }
+ for(const [a,b,k] of ARB){
+  if(!on[a]||!on[b])continue;
+  const F=clamp(k*(L[b]-L[a]),-4000,4000);            // right side more compressed -> push it up, left side down
+  const pa=rot(WHEELS[a].x,-.22,WHEELS[a].z),pb=rot(WHEELS[b].x,-.22,WHEELS[b].z);
+  rapierCarBody.applyImpulseAtPoint({x:0,y:F*h,z:0},{x:t.x+pa.x,y:t.y+pa.y,z:t.z+pa.z},true);
+  rapierCarBody.applyImpulseAtPoint({x:0,y:-F*h,z:0},{x:t.x+pb.x,y:t.y+pb.y,z:t.z+pb.z},true);
+ }
+}
+// Ackermann geometry: the inside front wheel turns more than the outside one so all wheels roll about one centre.
+function ackermann(i){
+ const d=car.steer,a=Math.abs(d);if(a<1e-4)return d;
+ const L=Math.abs(FZ-RZ),T=TRACK*2,R=L/Math.tan(a);
+ const inner=Math.atan(L/(R-T/2)),outer=Math.atan(L/(R+T/2));
+ const isInner=(d>0)?(WHEELS[i].x<0):(WHEELS[i].x>0);   // +steer = left turn, left wheel is x<0
+ return Math.sign(d)*(isInner?inner:outer);
+}
+// ---- Gravity presets (real surface gravities). G drives the physics world, the player and the tyre loads. Spring rates scale with g so ride height stays the same. ----
+const GRAVITIES=[{n:'Earth',g:9.80665},{n:'Mars',g:3.72076},{n:'Moon',g:1.62},{n:'Heavy 1.5 g',g:14.709975}];
+let gravIdx=0;
+function applyGravity(){
+ G=GRAVITIES[gravIdx].g;
+ if(!rapierReady)return;
+ rapierWorld.gravity={x:0,y:-G,z:0};
+ const k=G/9.80665,sk=Math.sqrt(k);
+ for(let i=0;i<4;i++){const fr=i<2;
+  rapierVehicle.setWheelSuspensionStiffness(i,(fr?28:25)*k);
+  rapierVehicle.setWheelSuspensionCompression(i,(fr?2.65:2.45)*sk);
+  rapierVehicle.setWheelSuspensionRelaxation(i,3.65*sk);
+  rapierVehicle.setWheelMaxSuspensionForce(i,36000*Math.max(1,k));
+ }
+}
+// ---- Engine data for the simulation-style drivetrain (about 205 hp turbo coupe, 6-speed) ----
+const ENG={idle:850,red:7000,up:6500,dn:2400,launch:3200,pk:270,pkR:4600,wid:3600,g:[0,3.38,2.15,1.58,1.22,.98,.80],rev:3.2,fin:3.42,eff:.9};
+function engTorque(r){const x=(r-ENG.pkR)/ENG.wid;return ENG.pk*Math.max(.5,1-.5*x*x)*clamp((r-800)/1500,.4,1);}   // Nm
+const LAUNCH={t:0,run:false,t50:0,t100:0};
+// Smoothed handbrake/drift engagement: rear grip and brake force fade in/out rather than snapping.
+car.driftBlend=car.driftBlend||0;
+car.pac=true;car.tcs=true;car.wheelW=[0,0,0,0];car.steerW=[0,0,0,0];car.tin=null;   // car.pac: Pacejka tyre model on (P toggles)   // 0-50 / 0-100 km/h timer shown in the HUD
+function qrot(q,x,y,z){const tx=2*(q.y*z-q.z*y),ty=2*(q.z*x-q.x*z),tz=2*(q.x*y-q.y*x);return {x:x+q.w*tx+(q.y*tz-q.z*ty),y:y+q.w*ty+(q.z*tx-q.x*tz),z:z+q.w*tz+(q.x*ty-q.y*tx)};}
+function stepRapierCar(dt){
+ let throttle=0,brake=0,steer=0,handbrake=false;
+ const fwd=car.vl;
+ if(car.occupied){
+  const up=keys.has('KeyW')||keys.has('ArrowUp'),dn=keys.has('KeyS')||keys.has('ArrowDown');
+  // W/S brake while rolling the opposite way, otherwise they are throttle / reverse
+  if(up&&!dn){if(fwd<-1)brake=1;else throttle=1;}
+  else if(dn&&!up){if(fwd>1)brake=1;else throttle=-1;}
+  steer=(keys.has('KeyA')||keys.has('ArrowLeft')?1:0)-(keys.has('KeyD')||keys.has('ArrowRight')?1:0);
+  handbrake=keys.has('Space');
+ }else{brake=1;handbrake=true;}
+ // pedal smoothing; braking releases the throttle instantly (Rapier ignores brakes while engine force is non-zero)
+ car.pedal=car.pedal||0;
+ // While braking against the direction of travel the pedal already ramps towards the new direction (drive stays cut),
+ // so the car switches to reverse/forward the moment it stops instead of waiting for the pedal to build up.
+ const pedalTarget=!car.occupied?0:(brake?(fwd<0?1:-1):throttle);
+ if(!car.occupied)car.pedal=0;else car.pedal+=(pedalTarget-car.pedal)*Math.min(1,dt*(Math.abs(pedalTarget)>Math.abs(car.pedal)?15:22));
+ if(Math.abs(car.pedal)<.03)car.pedal=0;
+ const vel=rapierCarBody.linvel(),speed=Math.hypot(vel.x,vel.z);
+ const driftTarget=(handbrake&&car.occupied&&speed>2)?1:0;
+ car.driftBlend+=(driftTarget-car.driftBlend)*(1-Math.exp(-dt*(driftTarget?4.2:2.1)));
+ const driftBlend=clamp(car.driftBlend,0,1);
+ // GTA-like traction transition: ordinary cornering keeps strong grip, but sustained lateral slip
+ // gently frees the rear axle instead of making the car snap from grip straight into a spin.
+ const slipAngle=Math.atan2(car.vr,Math.max(Math.abs(car.vl),2));
+ const slideTarget=car.occupied&&speed>5?clamp((Math.abs(slipAngle)-.12)/.48,0,1):0;
+ car.slideBlend=car.slideBlend||0;
+ car.slideBlend+=(slideTarget-car.slideBlend)*(1-Math.exp(-dt*(slideTarget>car.slideBlend?2.8:1.45)));
+ const slideBlend=clamp(car.slideBlend,0,1);
+ car.steeringPull*=Math.pow(.5,dt/4);   // alignment pull fades (half-life 4 s) instead of lasting forever
+ const maxSteer=(HM.fSteeringLock*Math.PI/180)/(1+(speed/18)**2),steerAngle=steer*maxSteer*(1-car.steeringDamage*.2)-car.steeringPull;
+ // Slightly slower steering unwind makes counter-steering and catching a slide less twitchy.
+ car.steer+=(steerAngle-car.steer)*Math.min(1,dt*(Math.abs(steerAngle)>Math.abs(car.steer)?13:10));
+ // GTA-style automatic gearbox: gears are speed bands up to V_TOP, shifts cut drive briefly (clutch)
+ if(throttle>0)PT.rev=false;else if(throttle<0)PT.rev=true;
+ const av=Math.abs(fwd),NG=HM.nInitialDriveGears;
+ if(PT.rev)PT.gear=1;
+ else if(PT.shift>0)PT.shift-=dt;
+ else if(PT.gear<NG&&av>.96*V_TOP*GFRAC[PT.gear]&&car.pedal>.3){PT.gear++;PT.shift=.5/HM.fClutchChangeRateScaleUpShift;}
+ else if(PT.gear>1&&av<.78*V_TOP*GFRAC[PT.gear-1]){PT.gear--;PT.shift=.25/HM.fClutchChangeRateScaleDownShift;}
+ const vGear=PT.rev?V_TOP*.3:V_TOP*GFRAC[PT.gear];
+ PT.rpm+=(IDLE+(REDLINE-IDLE)*clamp(av/vGear,0,1)-PT.rpm)*Math.min(1,dt*12);
+ // drive force = fInitialDriveForce * mass * g * (V_TOP / gear top speed), fading to 0 at the gear's top speed
+ let drive=0;
+ if(car.pedal!==0&&PT.shift<=0&&!brake){
+  const ratioG=PT.rev?2.2:1/GFRAC[PT.gear],taper=Math.max(0,1-(av/vGear)**2);
+  drive=HM.fInitialDriveForce*HM.fMass*9.81*ratioG*taper*Math.abs(car.pedal)*Math.sign(car.pedal)*(car.stall?0:1-car.engineDamage*.72);
+ }
+ // ---- Simulation-style engine + gearbox (press V): torque curve -> gear ratios -> final drive -> wheels. RPM comes from the driven
+ // wheels, so wheelspin revs the engine; the clutch slips off the line; auto-shifts with torque cut; rev limiter. ----
+ if(car.eng&&rapierReady){
+  const E=ENG,Wd=Math.max(Math.abs((car.wheelW[2]+car.wheelW[3])/2),av/TIRE.R);
+  car.egear=car.egear||1;car.es=car.es||0;car.erpm=car.erpm||E.idle;
+  if(PT.rev)car.egear=1;
+  const gr=PT.rev?E.rev:E.g[car.egear];
+  const clutch=clamp(1-av/3,0,1);                                           // clutch slips below ~11 km/h so the engine never stalls
+  const rpmT=Math.max(E.idle,Wd*gr*E.fin*9.5493,(car.pedal!==0?clutch*E.launch:0));
+  car.erpm+=(rpmT-car.erpm)*Math.min(1,dt*18);
+  if(car.es>0)car.es-=dt;
+  else if(!PT.rev){
+   if(car.egear<6&&car.erpm>E.up&&car.pedal>.3){car.egear++;car.es=.22;}
+   else if(car.egear>1&&car.erpm<E.dn&&car.egear>1){car.egear--;car.es=.16;}
+  }
+  PT.gear=car.egear;PT.rpm=car.erpm;
+  let T=0;
+  if(car.pedal!==0&&car.es<=0&&!brake&&car.erpm<E.red)T=engTorque(car.erpm)*Math.abs(car.pedal)*Math.sign(car.pedal);
+  drive=T*gr*E.fin*E.eff/TIRE.R*(car.stall?0:1-car.engineDamage*.72);
+ }
+ // Standstill launch: wheel friction is unreliable below ~2 m/s (the slow crawl off the line), so near zero speed the
+ // drive force is applied straight to the chassis and hands over smoothly to the wheels as the car gets moving.
+ if(handbrake&&car.occupied)drive*=1-.18*driftBlend;   // retain throttle during a handbrake turn, with only a small torque cut
+ const assist=car.occupied&&!car.pac?clamp(1-speed/2,0,1):0;
+ car.assistF=drive*assist;car.driveF=drive;drive*=1-assist;
+ // brakes: 65/35 front/rear bias, engine braking on the rear axle, handbrake locks the rears and cuts their grip
+ const fb=brake?BRAKE_TOTAL*HM.fBrakeForce*HM.fMass/1500:0,eb=(car.pedal===0&&PT.shift<=0)?(Math.abs(fwd)>.5?3:25):0;   // engine braking all the way to a stop (stronger hold at crawl speed), otherwise the car creeps at ~2 km/h forever
+ for(let i=0;i<4;i++){
+  rapierVehicle.setWheelSteering(i,i<2?ackermann(i):0);car.steerW[i]=i<2?ackermann(i):0;
+  rapierVehicle.setWheelEngineForce(i,(i<2?HM.fDriveBiasFront:1-HM.fDriveBiasFront)*drive/2);
+  rapierVehicle.setWheelBrake(i,!car.occupied?950:(i<2?fb*HM.fBrakeBiasFront/2:fb*(1-HM.fBrakeBiasFront)/2+eb+(handbrake?driftBlend*110*HM.fHandBrakeForce/.7:0)));
+  const slipDeg=Math.atan2(Math.abs(car.vr),Math.max(Math.abs(car.vl),1))*57.2958,biasT=2*(i<2?HM.fTractionBiasFront:1-HM.fTractionBiasFront);
+  let grip=gtaTraction(slipDeg,(i<2?HM.fDriveBiasFront:1-HM.fDriveBiasFront)>0,car.pedal,speed)*biasT;
+  if(i>=2&&car.occupied){
+   // Rear traction falls progressively with real lateral slip, even without the handbrake.
+   // The handbrake adds a deeper but still blended reduction, so slides are catchable rather than binary.
+   const naturalRearScale=1-.18*slideBlend;
+   const handbrakeRearScale=1-.38*driftBlend;
+   grip*=naturalRearScale*handbrakeRearScale;
+  // Crash-damaged tyres lose grip progressively; this is a handling penalty, not a visual effect.
+  grip*=1-car.tireDamage*.25;
+  }
+  rapierVehicle.setWheelFrictionSlip(i,grip);
+ }
+ if(car.pac){
+  const R=TIRE.R,park=!car.occupied,fbT=brake?HM.fBrakeForce*10.8*HM.fMass*R:0,ebT=eb?(eb>3?300:80):0,hbT=handbrake&&car.occupied?driftBlend*3500*HM.fMass/1500:0;   // 16200 N ~ 1.1 g for 1500 kg
+  car.tin={T:[0,1,2,3].map(i=>(i<2?HM.fDriveBiasFront:1-HM.fDriveBiasFront)*drive*R/2),
+   B:[0,1,2,3].map(i=>park?4000*HM.fMass/1500:(i<2?fbT*HM.fBrakeBiasFront/2:fbT*(1-HM.fBrakeBiasFront)/2+ebT+hbT)),abs:!park&&!!brake};
+  for(let i=0;i<4;i++){rapierVehicle.setWheelEngineForce(i,0);rapierVehicle.setWheelBrake(i,0);rapierVehicle.setWheelFrictionSlip(i,1e-4);}
+ }
+ rapierAccumulator=Math.min(rapierAccumulator+dt,.25);const pT0=performance.now();let nSteps=0;
+ if(!rapCur){rapCur={t:rapierCarBody.translation(),q:rapierCarBody.rotation()};rapPrev=rapCur;}
+ while(rapierAccumulator>=RAP_STEP){
+  rapierWorld.timestep=RAP_STEP;
+  // parking brake: tyre friction alone lets an empty car creep down slopes, so hold it once it is nearly still
+  {const hv=car.occupied?(throttle===0&&!brake?.25:0):.8;if(hv){const pv=rapierCarBody.linvel();if(Math.hypot(pv.x,pv.z)<hv)rapierCarBody.setLinvel({x:0,y:pv.y,z:0},true);}}   // also settle a coasting car to a true stop instead of a crawl
+  rapPrev=rapCur;
+  rapierForces(RAP_STEP);
+  if(car.pac)pacTires(RAP_STEP);
+  rapierVehicle.updateVehicle(RAP_STEP,RAPIER.QueryFilterFlags.EXCLUDE_DYNAMIC);
+  // Detect real collision impulses from the rigid body's velocity change across one fixed physics step.
+  // Normal throttle/braking changes are tiny at 120 Hz; sharp changes indicate an impact.
+  const preImpactV=rapierCarBody.linvel();
+  rapierWorld.step();
+  const postImpactV=rapierCarBody.linvel();
+  const dvx=postImpactV.x-preImpactV.x,dvz=postImpactV.z-preImpactV.z;
+  const impactDelta=Math.hypot(dvx,dvz);
+  // Only treat a hit as a crash (spin, speed loss, damage) when a solid block or the world edge is actually next to the car.
+  // Landing on terrain or a ramp from a jump is left to the physics engine: the crash response used to guess a lever arm from the nearest
+  // block anywhere on the map, which made nose-first landings spin or stop the car oddly.
+  let hitSolid=false;
+  if(impactDelta>1.0){
+   const bp=rapierCarBody.translation();
+   if(Math.abs(bp.x)>WORLD-4||Math.abs(bp.z)>WORLD-4)hitSolid=true;
+   else for(const o of solids){
+    if(Number.isFinite(o.y)&&Number.isFinite(o.h)&&(bp.y+.5<o.y-o.h*.5||bp.y-.8>o.y+o.h*.5))continue;
+    const gx=Math.max(0,Math.abs(o.x-bp.x)-o.w*.5),gz=Math.max(0,Math.abs(o.z-bp.z)-o.d*.5);
+    if(Math.hypot(gx,gz)<2.6){hitSolid=true;break;}
+   }
+  }
+  if(impactDelta>1.0&&hitSolid){
+   // Impact geometry: the velocity change points along the contact normal, so compare it with the approach velocity.
+   // closing speed = how fast the car was moving INTO the surface; cosInc = 1 for a head-on hit, ~0 for a glancing scrape.
+   const spPre=Math.max(Math.hypot(preImpactV.x,preImpactV.z),1e-3),nX=dvx/impactDelta,nZ=dvz/impactDelta;
+   const vnClose=Math.max(0,-(preImpactV.x*nX+preImpactV.z*nZ)),cosInc=clamp(vnClose/spPre,0,1);
+   const severity=clamp((vnClose-2.5)/20,0,.34);
+   const fX=-Math.sin(car.yaw),fZ=-Math.cos(car.yaw),rX=Math.cos(car.yaw),rZ=-Math.sin(car.yaw);
+   const deltaLong=dvx*fX+dvz*fZ,deltaSide=dvx*rX+dvz*rZ;
+   const longitudinal=Math.abs(deltaLong),lateral=Math.abs(deltaSide);
+   // Estimate the actual side/corner of contact from the nearest solid obstacle, in the
+   // car's local frame. Using the velocity-change direction alone misses glancing hits
+   // near the middle of a bumper, so derive the lever arm from obstacle position instead.
+   const mass=rapierCarBody.mass(),bodyPos=rapierCarBody.translation();
+   const bodyYaw=Math.atan2(2*(rapierCarBody.rotation().w*rapierCarBody.rotation().y),1-2*(rapierCarBody.rotation().y*rapierCarBody.rotation().y));
+   const bFX=-Math.sin(bodyYaw),bFZ=-Math.cos(bodyYaw),bRX=Math.cos(bodyYaw),bRZ=-Math.sin(bodyYaw);
+   let best=null,bestScore=Infinity;
+   for(const o of solids){
+    if(Number.isFinite(o.y)&&Number.isFinite(o.h)){
+     const obBottom=o.y-o.h*.5,obTop=o.y+o.h*.5;
+     if(bodyPos.y+.15<obBottom||bodyPos.y-.45>obTop)continue;
+    }
+    const ox=o.x-bodyPos.x,oz=o.z-bodyPos.z;
+    const lx=ox*bRX+oz*bRZ,lz=ox*bFX+oz*bFZ;
+    const rad=Math.hypot(o.w||1,o.d||1)*.5;
+    const gapX=Math.max(0,Math.abs(lx)-(.98+rad)),gapZ=Math.max(0,Math.abs(lz)-(2.3+rad));
+    const score=gapX*gapX+gapZ*gapZ;
+    if(score<bestScore){bestScore=score;best={lx,lz};}
+   }
+   // Place the contact on the car perimeter in the direction of the obstacle. This gives
+   // even near-centre bumper hits a proportional lever arm, while corner hits get the most.
+   let localContactX=0,localContactZ=0;
+   if(best){
+    const scale=Math.max(Math.abs(best.lx)/.98,Math.abs(best.lz)/2.3,1e-3);
+    localContactX=clamp(best.lx/scale,-.98,.98);
+    localContactZ=clamp(best.lz/scale,-2.3,2.3);
+   }else{
+    // Fallback for non-obstacle contacts: infer a small off-centre lever arm from the impulse.
+    localContactX=Math.sign(deltaSide)*.38;
+    localContactZ=Math.sign(-deltaLong)*1.1;
+   }
+   const contactX=bRX*localContactX+bFX*localContactZ;
+   const contactZ=bRZ*localContactX+bFZ*localContactZ;
+   // ---- Energy-based crash model ----
+   // 1) Restitution: Rapier's solver is almost perfectly inelastic, so add the rebound real structures give back (falls with speed).
+   const vn=vnClose,e=CR.e0+CR.e1*Math.exp(-vn/CR.eS),postN=postImpactV.x*nX+postImpactV.z*nZ,wantN=e*vn;
+   if(wantN>postN){const J=mass*(wantN-postN);rapierCarBody.applyImpulseAtPoint({x:nX*J,y:0,z:nZ*J},{x:bodyPos.x+contactX,y:bodyPos.y,z:bodyPos.z+contactZ},true);}   // at the contact point, so an off-centre hit still swings the car around (r x J)
+   // 2) Energy absorbed by crumpling = 1/2 m v^2 (1-e^2); no permanent damage below ~8 km/h, then crush grows linearly with speed.
+   const zoneK=Math.abs(localContactZ)/2.3>Math.abs(localContactX)/.98?(localContactZ<0?'front':'rear'):'side';
+   const crush=Math.min(Math.max(0,vn-CR.b0)*CR.k,CR.room[zoneK]),d=clamp(crush/CR.room[zoneK],0,1);   // d = share of the crush space used up (the nose has far more than a door)
+   // 3) Crash pulse: dV = v(1+e) delivered as a half-sine over ~65-120 ms -> peak g.
+   const dV=vn*(1+e),T=CR.t0+CR.t1*vn,gPk=Math.PI*dV/(2*T)/9.81;
+   // 4) Damage follows crush depth and where it happened.
+   if(d>0){
+    if(zoneK==='side'){car.steeringDamage=clamp(car.steeringDamage+d*.45,0,.45);car.tireDamage=clamp(car.tireDamage+d*.4,0,.5);car.steeringPull=clamp(car.steeringPull+Math.sign(deltaSide||1)*d*.05,-.05,.05);}
+    else{car.engineDamage=clamp(car.engineDamage+d*(zoneK==='front'?.6:.3),0,.6);car.steeringDamage=clamp(car.steeringDamage+d*.15,0,.45);car.tireDamage=clamp(car.tireDamage+d*.15,0,.5);}
+   }
+   {const av=rapierCarBody.angvel(),c=v=>clamp(v,-12,12);rapierCarBody.setAngvel({x:c(av.x),y:c(av.y),z:c(av.z)},true);}   // solver safety only
+   car.crashG=gPk;car.crushCm=crush*100;
+   {const where=zoneK==='side'?(localContactX>0?'right side':'left side'):zoneK;
+    car.hit={t:4,txt:Math.round(spPre*3.6)+' km/h · '+where+' · '+(cosInc>.8?'head-on':cosInc>.4?'angled':'glancing')+' · dV '+Math.round(dV*3.6)+' km/h · '+gPk.toFixed(0)+' g · crush '+Math.round(crush*100)+' cm · e='+e.toFixed(2)};}
+  }
+  // ---- Rollover physics ----
+  {const rq=rapierCarBody.rotation(),upW=qrot(rq,0,1,0),upY=upW.y,fW=qrot(rq,0,0,-1),rW=qrot(rq,1,0,0),av=rapierCarBody.angvel(),m=rapierCarBody.mass(),bp=rapierCarBody.translation();
+   let on=0;for(let i=0;i<4;i++){try{if(rapierVehicle.wheelIsInContact(i))on++;}catch(_){}}
+   car.upY=upY;
+   // 1) Tripping: sliding sideways faster than ~25 km/h, the tyres/rims dig in. The sideways force acts at ground height, far below the
+   //    centre of mass, so it makes a roll moment (F x h). Higher centre of mass / faster slide = more likely to tip.
+   const vlat=postImpactV.x*rW.x+postImpactV.z*rW.z,fac=on>0?clamp((Math.abs(vlat)-RO.digV)/6,0,1):0;car.dig=fac;
+   if(fac>0){const J=fac*RO.digMu*m*G*RAP_STEP*Math.sign(-vlat);rapierCarBody.applyImpulseAtPoint({x:rW.x*J,y:0,z:rW.z*J},{x:bp.x-upW.x*.78,y:bp.y-upW.y*.78,z:bp.z-upW.z*.78},true);}
+   // 2) Roll counter: angle turned about the long axis while tipped past ~45 degrees.
+   const rollRate=av.x*fW.x+av.y*fW.y+av.z*fW.z;
+   if(upY<.7)car.rollAcc=(car.rollAcc||0)+Math.abs(rollRate)*RAP_STEP;
+   else if(upY>.95&&on>=3&&(car.rollAcc||0)>0){if(car.rollAcc>1.4)car.rollInfo={t:6,txt:'ROLLOVER '+(car.rollAcc/6.283).toFixed(1)+' turns'+(car.roofDmg>0?' · roof '+Math.round(car.roofDmg*100)+'% crushed':'')};car.rollAcc=0;}
+   // 3) Inverted engines starve of oil/fuel and cut out; they restart once the car is back on its wheels.
+   if(upY<RO.stallUp){car.invT=(car.invT||0)+RAP_STEP;if(car.invT>RO.stallT)car.stall=true;}
+   else if(upY>.7){car.invT=0;car.stall=false;}
+   // 4) Body slam onto roof/side panels: bounce uses the same speed-dependent restitution, crush space is far smaller than the nose.
+   const vc=Math.max(0,-preImpactV.y),dvy=postImpactV.y-preImpactV.y;
+   if(upY<.5&&on<2&&dvy>2&&vc>2){
+    const e=CR.e0+CR.e1*Math.exp(-vc/CR.eS),roof=upY<-.3,room=roof?RO.roofRoom:CR.room.side;
+    if(postImpactV.y<e*vc){const v=rapierCarBody.linvel();rapierCarBody.setLinvel({x:v.x,y:e*vc,z:v.z},true);}
+    const crush=Math.min(Math.max(0,vc-CR.b0)*CR.k*(roof?RO.roofK:1),room),d=crush/room,dV=vc*(1+e),gPk=Math.PI*dV/(2*(CR.t0+CR.t1*vc))/9.81;
+    if(roof)car.roofDmg=clamp((car.roofDmg||0)+d,0,1);else car.steeringDamage=clamp(car.steeringDamage+d*.2,0,.45);
+    car.tireDamage=clamp(car.tireDamage+d*.1,0,.5);
+    car.hit={t:4,txt:Math.round(vc*3.6)+' km/h · '+(roof?'roof':'body side')+' slam · dV '+Math.round(dV*3.6)+' km/h · '+gPk.toFixed(0)+' g · crush '+Math.round(crush*100)+' cm'};
+   }
+  }
+  rapierAccumulator-=RAP_STEP;
+  rapCur={t:rapierCarBody.translation(),q:rapierCarBody.rotation()};
+  if(++nSteps>=24){rapierAccumulator=0;break;}
+ }
+ car.physMs=(car.physMs||0)*.9+(performance.now()-pT0)*.1;
+ // Physics runs at a fixed 120 Hz; blend the last two states so rendering is smooth at any refresh rate.
+ const ia=clamp(rapierAccumulator/RAP_STEP,0,1),P0=rapPrev.t,P1=rapCur.t,Q0=rapPrev.q,Q1=rapCur.q;
+ const t={x:P0.x+(P1.x-P0.x)*ia,y:P0.y+(P1.y-P0.y)*ia,z:P0.z+(P1.z-P0.z)*ia};
+ const qs=(Q0.x*Q1.x+Q0.y*Q1.y+Q0.z*Q1.z+Q0.w*Q1.w)<0?-1:1;
+ const q={x:Q0.x+(qs*Q1.x-Q0.x)*ia,y:Q0.y+(qs*Q1.y-Q0.y)*ia,z:Q0.z+(qs*Q1.z-Q0.z)*ia,w:Q0.w+(qs*Q1.w-Q0.w)*ia};
+ {const ql=Math.hypot(q.x,q.y,q.z,q.w)||1;q.x/=ql;q.y/=ql;q.z/=ql;q.w/=ql;}
+ if(!Number.isFinite(P1.x)||!Number.isFinite(P1.y)||!Number.isFinite(P1.z)||P1.y<-12||Math.abs(P1.x)>WORLD+3||Math.abs(P1.z)>WORLD+3){resetCar(0,2.2,0);return;}
+ const vel2=rapierCarBody.linvel();   // read after stepping, so speed/slip reflect this frame
+ const WL=[];for(let i=0;i<4;i++){let l=.12;try{const v=rapierVehicle.wheelSuspensionLength(i);if(Number.isFinite(v))l=v;}catch(_){}WL.push(l);}
+ const WLv=WL.map(l=>Math.min(l,.1+.2));   // visual wheel droop limited to ~20 cm below ride height
+ const Lavg=(WLv[0]+WLv[1]+WLv[2]+WLv[3])/4;
+ // Keep the physics-derived pose for gameplay, but smooth the rendered ride-height offset
+ // separately so chassis height doesn't jump when wheel-ray lengths change at a terrain seam.
+ if(!rideHeightVisual.ready){rideHeightVisual.x=Lavg;rideHeightVisual.v=0;rideHeightVisual.ready=true;}
+ const smoothLavg=dampedVisualSpring(rideHeightVisual,Lavg,suspensionFrameDt,3.2,1.0);
+ {const o=qrot(q,0,-(.22+Lavg),0),ov=qrot(q,0,-(.22+smoothLavg),0);car.x=t.x+o.x;car.y=t.y+o.y;car.renderY=t.y+ov.y;car.z=t.z+o.z;}   // visual sprung-mass ride height is smoothed independently of the collision pose
+ // Quaternion to yaw/pitch/roll, matching the existing WebGL model convention.
+ const siny=2*(q.w*q.y+q.x*q.z),cosy=1-2*(q.y*q.y+q.x*q.x);
+ car.yaw=Math.atan2(siny,cosy);
+ const sinp=2*(q.w*q.x-q.z*q.y);car.pitch=Math.asin(clamp(sinp,-1,1));
+ const sinr=2*(q.w*q.z+q.x*q.y),cosr=1-2*(q.x*q.x+q.z*q.z);car.roll=Math.atan2(sinr,cosr);
+ const forwardX=-Math.sin(car.yaw),forwardZ=-Math.cos(car.yaw);
+ car.vl=vel2.x*forwardX+vel2.z*forwardZ;car.vr=vel2.x*Math.cos(car.yaw)-vel2.z*Math.sin(car.yaw);car.w=rapierCarBody.angvel().y;
+ if(car.hit&&car.hit.t>0)car.hit.t-=dt;if(car.rollInfo&&car.rollInfo.t>0)car.rollInfo.t-=dt;
+ {// Weight transfer: longitudinal / lateral acceleration -> body dive, squat and roll (body mesh only), plus per-wheel load for the HUD
+  const aLong=(car.vl-(car.pvl===undefined?car.vl:car.pvl))/Math.max(dt,1e-3);car.pvl=car.vl;
+  car.aLs=(car.aLs||0)+(aLong-(car.aLs||0))*Math.min(1,dt*8);
+  const aRight=-car.vl*car.w;                                          // centripetal acceleration along the car's right axis
+  car.visPitch=(car.visPitch||0)+(clamp(.0075*car.aLs,-.11,.11)-(car.visPitch||0))*Math.min(1,dt*9);   // braking: nose dives, accelerating: tail squats
+  car.visRoll=(car.visRoll||0)+(clamp(.0085*aRight,-.12,.12)-(car.visRoll||0))*Math.min(1,dt*9);        // body leans toward the outside of a turn
+  car.wl=car.wl||[1,1,1,1];
+  for(let i=0;i<4;i++){let f=0;try{f=rapierVehicle.wheelSuspensionForce(i);}catch(_){}car.wl[i]+=((Number.isFinite(f)?f:0)-car.wl[i])*Math.min(1,dt*14);}
+ }
+ car.speed=car.vl;car.vy=vel2.y;car.brakeLit=car.occupied&&(brake>0||handbrake);
+ if(car.pac){car.spinF+=(car.wheelW[0]+car.wheelW[1])/2*dt;car.spinR+=(car.wheelW[2]+car.wheelW[3])/2*dt;}else{car.spinF+=car.vl*dt/.36;car.spinR+=car.vl*dt/.36;}
+ {const kmh=Math.abs(car.vl)*3.6;
+  if(!LAUNCH.run&&car.occupied&&throttle>0&&kmh<2){LAUNCH.run=true;LAUNCH.t=0;LAUNCH.t50=0;LAUNCH.t100=0;}
+  if(LAUNCH.run){LAUNCH.t+=dt;if(!LAUNCH.t50&&kmh>=50)LAUNCH.t50=LAUNCH.t;if(!LAUNCH.t100&&kmh>=100){LAUNCH.t100=LAUNCH.t;LAUNCH.run=false;}if(!car.occupied||throttle<=0||brake>0)LAUNCH.run=false;}}
+ for(let i=0;i<4;i++)suspension[i].x=clamp(Lavg-WLv[i],-.45,.3);   // wheel centre follows the simulated suspension
+}
+function resetCar(x=car.x,z=car.z,yawNew=car.yaw){
+  car.engineDamage=0;car.steeringDamage=0;car.tireDamage=0;car.steeringPull=0;car.spinPend=0;car.roofDmg=0;car.stall=false;car.invT=0;car.rollAcc=0;car.wheelW=[0,0,0,0];
+ const gy=surfaceHeight(x,z);
+ if(rapierReady){rapPrev=rapCur=null;const h=yawNew/2;rapierCarBody.setTranslation({x,y:gy+.85,z},true);rapierCarBody.setRotation({x:0,y:Math.sin(h),z:0,w:Math.cos(h)},true);rapierCarBody.setLinvel({x:0,y:0,z:0},true);rapierCarBody.setAngvel({x:0,y:0,z:0},true);}
+ car.x=x;car.z=z;car.yaw=yawNew;car.y=gy+.36;car.renderY=car.y;car.driftBlend=0;car.slideBlend=0;rideHeightVisual.ready=false;for(const sv of suspensionVisual){sv.x=0;sv.v=0;}car.pitch=car.roll=car.pitchV=car.rollV=0;car.vl=car.vr=car.w=car.vy=0;car.steer=0;car.air=false;car.gT=undefined;
+}
+// Player is a circle, the parked car an oriented box: push the player out along the shallowest axis.
+function pushPlayerOutOfCar(){
+ if(car.occupied)return;
+ const fx=-Math.sin(car.yaw),fz=-Math.cos(car.yaw),rx=Math.cos(car.yaw),rz=-Math.sin(car.yaw);
+ const dx=player.x-car.x,dz=player.z-car.z,lf=dx*fx+dz*fz,lr=dx*rx+dz*rz,hl=2.3+player.r,hw=1.05+player.r;
+ if(Math.abs(lf)>=hl||Math.abs(lr)>=hw)return;
+ const penF=hl-Math.abs(lf),penR=hw-Math.abs(lr);
+ if(penR<penF){const sg=lr>=0?1:-1;player.x+=rx*sg*penR;player.z+=rz*sg*penR;}else{const sg=lf>=0?1:-1;player.x+=fx*sg*penF;player.z+=fz*sg*penF;}
+}
+function gearLabel(){if(rapierReady)return PT.rev?'R':'G'+PT.gear;if(car.vl<-.5)return 'R';let g=1;for(const v of [10,17,25,33])if(car.vl>v)g++;return 'G'+g;}
+function isDrifting(){return Math.abs(car.vl)>5&&Math.abs(Math.atan2(car.vr,Math.abs(car.vl)))>.28;}
+function update(dt){
+ if(keys.has('KeyE')&&!update.eWasDown){
+   update.eWasDown=true;
+   if(car.occupied){
+     car.occupied=false;
+     const c=Math.cos(car.yaw),s=Math.sin(car.yaw);
+     let ex=car.x+c*1.8,ez=car.z-s*1.8;
+     if(collides(ex,ez)){ex=car.x-c*1.8;ez=car.z+s*1.8;if(collides(ex,ez)){ex=car.x;ez=car.z;}}
+     player.x=ex;player.z=ez;player.y=surfaceHeight(ex,ez)+1.7;vy=0;pvx=pvz=0;landDip=0;grounded=true;yaw=car.yaw;pitch=0;
+   } else if(Math.hypot(player.x-car.x,player.z-car.z)<3.2&&Math.abs(car.vl)<8){
+     car.occupied=true; driveOrbitYaw=car.yaw; driveOrbitPitch=-0.38;
+   }
+ } else if(!keys.has('KeyE')) update.eWasDown=false;
+
+ if(keys.has('KeyR')&&!update.rWasDown){update.rWasDown=true;if(car.occupied)resetCar();}else if(!keys.has('KeyR'))update.rWasDown=false;
+ stepCar(dt);
+ if(car.occupied){
+   player.x=car.x;player.y=car.y+1.05;player.z=car.z;
+ } else {
+   const f=(keys.has('KeyW')||keys.has('ArrowUp')?1:0)-(keys.has('KeyS')||keys.has('ArrowDown')?1:0);
+   const s=(keys.has('KeyD')||keys.has('ArrowRight')?1:0)-(keys.has('KeyA')||keys.has('ArrowLeft')?1:0);
+   const len=Math.hypot(f,s)||1, speed=keys.has('ShiftLeft')||keys.has('ShiftRight')?9:5.3;
+   const wx=(-Math.sin(yaw)*f/len+Math.cos(yaw)*s/len)*speed,wz=(-Math.cos(yaw)*f/len-Math.sin(yaw)*s/len)*speed;
+   const ac=Math.min(1,dt*(grounded?14:1.2));   // full control on the ground, very little in the air
+   pvx+=(wx-pvx)*ac;pvz+=(wz-pvz)*ac;
+   move(pvx*dt,pvz*dt);
+   landDip-=landDip*Math.min(1,dt*7);
+   const gy=surfaceHeight(player.x,player.z)+1.7;
+   if(grounded&&player.y-gy<.35){player.y=gy;vy=0;}
+   else{
+    vy+=(-G+(vy<0?1:-1)*DRAG_K*vy*vy)*dt;player.y+=vy*dt;grounded=false;
+    if(player.y<=gy){const hit=-vy;player.y=gy;vy=0;grounded=true;
+     if(hit>3){landDip=Math.min(.4,hit*.014);if(hit>7){const k=Math.max(.25,1-(hit-7)*.06);pvx*=k;pvz*=k;}}}   // hard landing: camera dip + lost speed
+   }
+   pushPlayerOutOfCar();
+ }
+}
+function drawWorld(M,sh){   // terrain, ramps and obstacles; used by both the shadow pass and the main pass
+ gl.bindBuffer(gl.ARRAY_BUFFER,terrainBuffer);gl.vertexAttribPointer(0,3,gl.FLOAT,false,24,0);gl.vertexAttribPointer(1,3,gl.FLOAT,false,24,12);if(!sh)gl.uniform3f(loc.tint,1,1,1);gl.uniformMatrix4fv(M,false,identity());gl.drawArrays(gl.TRIANGLES,0,terrainFloats.length/6);
+ gl.bindBuffer(gl.ARRAY_BUFFER,rampBuffer);gl.vertexAttribPointer(0,3,gl.FLOAT,false,24,0);gl.vertexAttribPointer(1,3,gl.FLOAT,false,24,12);gl.drawArrays(gl.TRIANGLES,0,rampFloats.length/6);
+ gl.bindBuffer(gl.ARRAY_BUFFER,cubeBuffer);gl.vertexAttribPointer(0,3,gl.FLOAT,false,24,0);gl.vertexAttribPointer(1,3,gl.FLOAT,false,24,12);
+ for(let oi=0;oi<cubeInstances.length;oi++){const o=cubeInstances[oi];if(!sh)gl.uniform3fv(loc.tint,o.color);gl.uniformMatrix4fv(M,false,modelMatrix(o));gl.drawArrays(gl.TRIANGLES,0,cubeCount);}
+}
+function draw(now){resize();gl.enable(gl.DEPTH_TEST);
+ const proj=perspective(74*Math.PI/180,canvas.width/canvas.height,.08,180),vp=multiply(proj,viewMatrix());
+ postOn=ensurePost();
+ if(shOK){   // pass 1: depth from the sun
+  const fo=car.occupied?[car.x,car.y,car.z]:[player.x,player.y-1.7,player.z];updateLightVP(fo[0],fo[1],fo[2]);
+  gl.bindFramebuffer(gl.FRAMEBUFFER,window._shFbo);gl.viewport(0,0,SM,SM);gl.clearColor(1,1,1,1);gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
+  gl.useProgram(shadowProg);gl.uniformMatrix4fv(su.vp,false,lightVP);drawWorld(su.model,true);drawCar(lightVP,true);
+  gl.bindFramebuffer(gl.FRAMEBUFFER,null);
+ }
+ bindMain();gl.clearColor(.36,.46,.55,1);gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);   // pass 2: lit scene sampling the shadow map
+ gl.useProgram(program);gl.uniformMatrix4fv(loc.vp,false,vp);gl.uniformMatrix4fv(loc.lvp,false,lightVP);gl.uniform1i(loc.sh,1);gl.uniform1f(loc.shOn,shOK?1:0);gl.uniform1f(loc.texel,1/SM);gl.uniform3f(loc.cam,camPos[0],camPos[1],camPos[2]);gl.uniform1f(loc.lit,dExt?1:0);
+ drawWorld(loc.model,false);
+ gl.uniform1f(loc.lit,0);gl.bindBuffer(gl.ARRAY_BUFFER,gridBuffer);gl.vertexAttribPointer(0,3,gl.FLOAT,false,24,0);gl.vertexAttribPointer(1,3,gl.FLOAT,false,24,12);gl.uniform3f(loc.tint,1,1,1);gl.uniformMatrix4fv(loc.model,false,identity());gl.drawArrays(gl.LINES,0,gridFloats.length/6);
+ drawCar(vp,false);
+ if(postOn)runPost();
+}
+play.addEventListener('click',()=>canvas.requestPointerLock());
+initRapierPhysics();
+document.addEventListener('pointerlockchange',()=>{locked=document.pointerLockElement===canvas;start.style.display=locked?'none':'grid';});
+document.addEventListener('pointerlockerror',()=>{error.textContent='Mouse capture was blocked. Click Start again, or use a local server.';});
+document.addEventListener('mousemove',e=>{if(!locked)return;if(car.occupied){driveOrbitYaw-=e.movementX*.0025;driveOrbitPitch=Math.max(-1.25,Math.min(-0.06,driveOrbitPitch-e.movementY*.0025));}else{yaw-=e.movementX*.0022;pitch=Math.max(-1.48,Math.min(1.48,pitch-e.movementY*.0022));}});
+document.addEventListener('keydown',e=>{keys.add(e.code);if(!e.repeat){if(e.code==='KeyG'){gravIdx=(gravIdx+1)%GRAVITIES.length;applyGravity();}if(e.code==='KeyT')car.tcs=!car.tcs;if(e.code==='KeyV')car.eng=!car.eng;if(e.code==='KeyY')car.stm=!car.stm;}if(e.code==='KeyP'){car.pac=!car.pac;car.wheelW=[0,0,0,0].map(()=>car.vl/TIRE.R);}if(['Space','ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(e.code))e.preventDefault();if(e.code==='Space'&&grounded&&!car.occupied){vy=3.2;grounded=false;}});
+document.addEventListener('keyup',e=>keys.delete(e.code));window.addEventListener('blur',()=>keys.clear());window.addEventListener('resize',resize);
+let last=performance.now(),frames=0,elapsed=0;
+const TIMESCALE=1.4;   // whole game runs 40% faster (walking, car, gravity); handling values are unchanged
+const loadEl=document.getElementById('load'),loadCells=loadEl.querySelectorAll('b');
+function updateLoadHud(){
+ const show=car.occupied&&rapierReady&&car.wl;loadEl.style.display=show?'grid':'none';if(!show)return;
+ const tot=car.wl[0]+car.wl[1]+car.wl[2]+car.wl[3]||1,order=[1,0,3,2];   // top-down: front-left, front-right, rear-left, rear-right
+ for(let k=0;k<4;k++){const pct=car.wl[order[k]]/tot*100;loadCells[k].textContent=Math.round(pct)+'%';loadCells[k].style.background='rgba(40,120,186,'+(.18+clamp((pct-10)/40,0,1)*.82).toFixed(2)+')';}
+}
+function loop(t){const rdt=Math.min((t-last)/1000,.1),dt=rdt*TIMESCALE;last=t;suspensionFrameDt=Math.max(1/240,dt);update(dt);draw(t);updateLoadHud();frames++;elapsed+=rdt;if(elapsed>.5){const nearCar=Math.hypot(player.x-car.x,player.z-car.z)<3.2;stats.textContent=Math.round(frames/elapsed)+' FPS · '+(rapierReady?'RAPIER · ':'CUSTOM · ')+(car.occupied?'DRIVING · '+Math.round(Math.abs(car.vl)*3.6)+' km/h · '+gearLabel()+(rapierReady?' · '+Math.round(PT.rpm/50)*50+' rpm':'')+(isDrifting()?' · DRIFT':'')+(rapierReady&&car.occupied?' · drive '+Math.round(car.driveF||0)+' N · phys '+(car.physMs||0).toFixed(1)+' ms':'')+(rapierReady&&car.occupied&&(LAUNCH.run||LAUNCH.t50||LAUNCH.t100)?' · 0-50: '+(LAUNCH.t50?LAUNCH.t50.toFixed(1):LAUNCH.t.toFixed(1)+'…')+'s'+(LAUNCH.t100?' · 0-100: '+LAUNCH.t100.toFixed(1)+'s':''):''):nearCar&&Math.abs(car.vl)<8?'Press E to enter car':'On foot')+' · g '+G.toFixed(2)+(gravIdx?' ('+GRAVITIES[gravIdx].n+')':'')+(car.hit&&car.hit.t>0?' · CRASH '+car.hit.txt:'')+((car.rollAcc||0)>1.4?' · ROLLING '+(car.rollAcc/6.283).toFixed(1)+' turns':'')+(car.rollInfo&&car.rollInfo.t>0?' · '+car.rollInfo.txt:'')+(car.stall?' · ENGINE CUT (inverted)':'')+(car.dig>.3?' · TYRES DIGGING IN':'')+(car.eng?' · ENGINE SIM':'')+(car.tcs?' · TCS'+(car.tcsAct?'!':''):'')+(car.stm?' · STM'+(car.stmAct?'!':''):'')+' · '+(cubeInstances.length+5)+' objects';frames=0;elapsed=0;}requestAnimationFrame(loop);}
+requestAnimationFrame(loop);
+})();
+</script>
+</body></html>
