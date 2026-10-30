@@ -1,0 +1,1497 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>3D Car Game - three.js + Jolt</title>
+<style>
+*{box-sizing:border-box}html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#91a8bc;color:#eef4fa;font:14px system-ui,sans-serif}
+canvas{display:block;width:100%;height:100%;outline:none}
+#hud{position:fixed;z-index:2;left:12px;top:12px;padding:10px 12px;min-width:210px;border:1px solid #344454;border-radius:8px;background:#101820df;pointer-events:none;box-shadow:0 5px 24px #0004}
+#hud strong{display:block;margin-bottom:4px}#stats{color:#a9c6db;font-variant-numeric:tabular-nums}#help{font-size:12px;color:#b8c2cd;margin-top:7px}
+#start{position:fixed;inset:0;z-index:3;display:grid;place-items:center;background:#070b10a8}
+.panel{max-width:380px;margin:20px;padding:24px;text-align:center;border:1px solid #506477;border-radius:12px;background:#131c26f2;box-shadow:0 18px 60px #0008}
+h1{font-size:24px;margin:0 0 8px}p{color:#c3d0dc}button{cursor:pointer;color:white;background:#2878ba;border:0;border-radius:7px;padding:10px 16px;font:inherit}button:hover{background:#328bd2}
+#crosshair{position:fixed;z-index:1;left:50%;top:50%;width:8px;height:8px;transform:translate(-50%,-50%);pointer-events:none}
+#crosshair:before,#crosshair:after{content:"";position:absolute;background:#fff9}#crosshair:before{width:8px;height:1px;left:0;top:3px}#crosshair:after{height:8px;width:1px;left:3px;top:0}
+#error{color:#ffb9a8;font-size:12px;white-space:pre-wrap}
+#load{position:fixed;z-index:2;right:14px;bottom:14px;display:none;grid-template-columns:repeat(2,50px);gap:5px;pointer-events:none;font:600 12px system-ui,sans-serif}
+#load b{height:50px;border-radius:7px;background:#2878ba;color:#fff;display:grid;place-items:center;border:1px solid #ffffff40;font-variant-numeric:tabular-nums}
+#loadlabel{grid-column:1/3;text-align:center;color:#c3d0dc;font-size:11px}
+</style>
+</head>
+<body>
+<div id="hud"><strong>3D Car Physics · three.js + Jolt</strong><div id="stats">Initializing WebGL…</div><div id="help">L: Low graphics toggle (reloads)<br>WASD move · Mouse look · Space jump<br>E enter/exit car · W/S drive · A/D steer · Space handbrake (drift)<br>Shift sprint when walking · R flip/reset car · P tyre model (Pacejka / GTA)<br>G gravity (Earth/Mars/Moon/Heavy) · T traction control · Y stability control · V engine sim<br>C cockpit view · N pause day/night · M skip 1.5 h</div></div>
+<div id="crosshair"></div>
+<div id="load"><div id="loadlabel">tyre load</div><b></b><b></b><b></b><b></b></div>
+<div id="start"><div class="panel"><h1>3D Engine Starter</h1><p>Jolt rigid-body physics with terrain, obstacle colliders, and raycast suspension. Requires an internet connection to load three.js and the physics engine.</p><p>Click below to capture the mouse and play.</p><button id="play" disabled>Loading physics…</button><p id="error"></p></div></div>
+<canvas id="view"></canvas>
+<script>
+(async () => {
+'use strict';
+const canvas=document.getElementById('view'), stats=document.getElementById('stats'), start=document.getElementById('start'), play=document.getElementById('play'), error=document.getElementById('error');
+// Graphics: full quality by default. Optional Low mode (press L, or ?q=low) trades some visuals for speed on very weak machines.
+let LOW;{let q=null;try{q=new URLSearchParams(location.search).get('q')||localStorage.getItem('gfxQ');}catch(_){}
+ LOW=q==='low';}
+// ---- three.js renderer ----
+let THREE=null;
+try{THREE=await import('https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js');}
+catch(e){stats.textContent='three.js failed to load';error.textContent='Could not load three.js from the CDN. Check your internet connection. '+String(e&&e.message||e);play.disabled=true;return;}
+THREE.ColorManagement.enabled=false;   // colours in this game are display-referred numbers: use them as-is
+let renderer;
+try{renderer=new THREE.WebGLRenderer({canvas,antialias:false,alpha:false,powerPreference:'high-performance'});}
+catch(e){stats.textContent='WebGL unavailable';error.textContent='This browser or graphics driver could not create a WebGL context. Try enabling hardware acceleration in browser settings. '+String(e&&e.message||e);play.disabled=true;return;}
+renderer.outputColorSpace=THREE.LinearSRGBColorSpace;
+renderer.shadowMap.enabled=true;renderer.shadowMap.type=THREE.PCFSoftShadowMap;
+renderer.setClearColor(0x5c758c,1);
+const scene=new THREE.Scene(),camera=new THREE.PerspectiveCamera(74,1,.08,1800);
+scene.fog=new THREE.FogExp2(0x5c758c,.0011);
+const cubeInstances=[];
+// World: a 2 km x 2 km triangulated heightfield with a road network and a procedurally placed city.
+// `solids` holds every building box; it feeds both the renderer and the Jolt colliders.
+const solids=[],WORLD=1000;
+// Gently uneven driving surface. The same height function drives the visible terrain mesh and the Jolt terrain collider.
+
+// ---- Huge 2 km GTA-inspired road network: wide highways, a ring road and a regular urban street grid. ----
+const ROAD_Y=.04,ROADS=[];
+const R_CLS={hw:{w:24,flat:13,asph:[.105,.11,.12],dy:.035},st:{w:11,flat:8.2,asph:[.16,.165,.17],dy:.02},pa:{w:3.5,flat:2.4,asph:[.50,.46,.38],dy:.015}};
+const addSeg=(cls,x0,z0,x1,z1)=>ROADS.push({k:'s',cls,x0,z0,x1,z1}),addRing=(cls,cx,cz,R)=>ROADS.push({k:'r',cls,cx,cz,R});
+// Main freeway cross and an outer loop, with feeder arterials every 320 m.
+addSeg('hw',-980,0,980,0);addSeg('hw',0,-980,0,980);addRing('hw',0,0,790);
+for(let c=-800;c<=800;c+=320){if(c!==0){addSeg('st',c,-960,c,960);addSeg('st',-960,c,960,c);}}
+// Local streets every 160 m create consistent city blocks across the full map.
+for(let c=-880;c<=880;c+=160){if(c!==0 && c%320!==0){addSeg('st',c,-960,c,960);addSeg('st',-960,c,960,c);}}
+function roadDistTo(r,x,z){
+ if(r.k==='s'){const dx=r.x1-r.x0,dz=r.z1-r.z0,t=Math.max(0,Math.min(1,((x-r.x0)*dx+(z-r.z0)*dz)/(dx*dx+dz*dz)));return Math.hypot(x-(r.x0+dx*t),z-(r.z0+dz*t));}
+ return Math.abs(Math.hypot(x-r.cx,z-r.cz)-r.R);
+}
+function roadPad(x,z){let m=1e9;for(const r of ROADS){const d=roadDistTo(r,x,z)-R_CLS[r.cls].flat;if(d<m)m=d;}const u=Math.max(0,Math.min(1,m/8));return 1-u*u*(3-2*u);}
+function rawGround(x,z){return Math.sin(x*.019+Math.sin(z*.011))*Math.sin(z*.016-x*.007)*1.1 + Math.sin(x*.043+z*.031)*.24-_ss(900,990,z)*2.4;}   // broad rolling terrain, falling into the southern ocean
+
+function _ss(a,b,x){const t=Math.max(0,Math.min(1,(x-a)/(b-a)));return t*t*(3-2*t);}
+const _tc=[0,0,0];
+// Simple natural ground palette with a wide sandy coastal strip; buildings remain plain solid blocks.
+function terrainCol(x,y,z){let r=.39,g=.40,b=.29,t=_ss(2,18,y);r+=(.57-r)*t;g+=(.49-g)*t;b+=(.35-b)*t;
+ t=_ss(900,948,z)*.92;r+=(.79-r)*t;g+=(.71-g)*t;b+=(.54-b)*t;
+ t=.16*(Math.sin(x*.017)*Math.sin(z*.016)*.5+.5);r+=(.48-r)*t;g+=(.45-g)*t;b+=(.29-b)*t;_tc[0]=r;_tc[1]=g;_tc[2]=b;return _tc;}
+function groundHeight(x,z){const p=roadPad(x,z);return rawGround(x,z)*(1-p)+ROAD_Y*p;}   // rolling ground, flat under roads
+function surfaceHeight(x,z){return groundHeight(x,z);}   // drivable / walkable surface height
+// ---- Huge GTA-inspired city blockout: realistic footprints and height zoning, but buildings stay plain solid blocks. ----
+{
+ let seed=20150917;const rnd=()=>{seed=(seed*1664525+1013904223)>>>0;return seed/4294967296;};
+ const COL=[[.59,.59,.58],[.53,.57,.60],[.68,.63,.56],[.47,.45,.43],[.64,.66,.67],[.70,.59,.49],[.56,.54,.51],[.62,.61,.57]];
+ const clearOfRoads=(x,z,hw,hd)=>{
+  for(const [px,pz] of [[x,z],[x-hw,z-hd],[x+hw,z-hd],[x-hw,z+hd],[x+hw,z+hd],[x,z-hd],[x,z+hd],[x-hw,z],[x+hw,z]])
+   for(const r of ROADS)if(roadDistTo(r,px,pz)<R_CLS[r.cls].w/2+3.5)return false;
+  return true;
+ };
+ // Roads are spaced 160 m apart. Give each block a believable mix of parcels rather than oversized towers everywhere.
+ for(let bx=-880;bx<=880;bx+=160)for(let bz=-880;bz<=880;bz+=160){
+  const cx=bx+80,cz=bz+80,dist=Math.hypot(cx,cz);
+  if(cz>900||Math.hypot(cx-7.8,cz-40)<30)continue;
+  // Downtown: a few towers with real tower footprints and breathing room around them.
+  if(dist<250){
+   const count=2+(rnd()<.55?1:0);
+   for(let i=0;i<count;i++){
+    const x=bx+38+rnd()*84,z=bz+38+rnd()*84,w=22+rnd()*23,d=22+rnd()*23;
+    if(!clearOfRoads(x,z,w/2,d/2))continue;
+    const H=48+rnd()*92+(dist<125?rnd()*55:0),gy=groundHeight(x,z);
+    const b={x,y:gy+H/2-.5,z,w,h:H+1,d,color:COL[Math.floor(rnd()*COL.length)]};cubeInstances.push(b);solids.push(b);
+   }
+  } else if(dist<520){
+   // Inner city: mid-rise apartments and commercial slabs, mixed with occasional taller buildings.
+   const count=3+(rnd()<.35?1:0);
+   for(let i=0;i<count;i++){
+    const x=bx+25+rnd()*110,z=bz+25+rnd()*110,w=15+rnd()*22,d=16+rnd()*25;
+    if(!clearOfRoads(x,z,w/2,d/2))continue;
+    const H=rnd()<.16?42+rnd()*34:12+rnd()*30,gy=groundHeight(x,z);
+    const b={x,y:gy+H/2-.5,z,w,h:H+1,d,color:COL[Math.floor(rnd()*COL.length)]};cubeInstances.push(b);solids.push(b);
+   }
+  } else {
+   // Outer neighborhoods: low, house-sized blocks with gaps between lots; a few larger warehouses near the edge.
+   const count=5+(rnd()<.45?1:0);
+   for(let i=0;i<count;i++){
+    const x=bx+18+rnd()*124,z=bz+18+rnd()*124;
+    const industrial=(Math.abs(cx)>700&&rnd()<.22),w=industrial?24+rnd()*20:8+rnd()*9,d=industrial?22+rnd()*24:9+rnd()*10;
+    if(!clearOfRoads(x,z,w/2,d/2))continue;
+    const H=industrial?7+rnd()*7:5.5+rnd()*5.5,gy=groundHeight(x,z);
+    const b={x,y:gy+H/2-.5,z,w,h:H+1,d,color:COL[Math.floor(rnd()*COL.length)]};cubeInstances.push(b);solids.push(b);
+   }
+  }
+ }
+}
+// ---- Buildings: one instanced mesh, per-instance colour, sun shadows ----
+const bldMesh=new THREE.InstancedMesh(new THREE.BoxGeometry(1,1,1),new THREE.MeshLambertMaterial({color:0xffffff}),Math.max(1,cubeInstances.length));
+{const tm=new THREE.Matrix4(),tc=new THREE.Color();
+ cubeInstances.forEach((o,i)=>{tm.fromArray(modelMatrix(o));bldMesh.setMatrixAt(i,tm);tc.setRGB(o.color[0],o.color[1],o.color[2]);bldMesh.setColorAt(i,tc);});
+ bldMesh.instanceMatrix.needsUpdate=true;if(bldMesh.instanceColor)bldMesh.instanceColor.needsUpdate=true;}
+bldMesh.castShadow=true;bldMesh.receiveShadow=true;bldMesh.frustumCulled=false;
+scene.add(bldMesh);
+
+// Terrain and roads are split into 100 m tiles (TILE) so three.js can cull whatever is outside the camera view or the sun's shadow box
+// instead of drawing the whole 2 km world every frame. TSTEP is the height-grid spacing and is also used by the Jolt terrain collider.
+const TILE=100,TSTEP=5,TN=Math.ceil((WORLD*2)/TILE);
+const tileAt=(x,z)=>Math.min(TN-1,Math.max(0,Math.floor((x+WORLD)/TILE)))+TN*Math.min(TN-1,Math.max(0,Math.floor((z+WORLD)/TILE)));
+// ---- Terrain: indexed 100 m tiles built from one shared height grid (smooth normals, frustum-culled by three.js) ----
+const terrainMat=new THREE.MeshLambertMaterial({vertexColors:true});
+{
+ const NG=Math.round(2*WORLD/TSTEP)+1,H=new Float32Array(NG*NG);
+ for(let gz=0;gz<NG;gz++)for(let gx=0;gx<NG;gx++)H[gz*NG+gx]=groundHeight(-WORLD+gx*TSTEP,-WORLD+gz*TSTEP);
+ const TC=TILE/TSTEP,tv=TC+1,idx=new Uint16Array(TC*TC*6);
+ {let k=0;for(let j=0;j<TC;j++)for(let i=0;i<TC;i++){const a=j*tv+i,b=a+1,c=a+tv+1,d=a+tv;idx[k++]=a;idx[k++]=c;idx[k++]=b;idx[k++]=a;idx[k++]=d;idx[k++]=c;}}
+ for(let tz=0;tz<TN;tz++)for(let tx=0;tx<TN;tx++){
+  const pos=new Float32Array(tv*tv*3),nor=new Float32Array(tv*tv*3),col=new Float32Array(tv*tv*3);
+  for(let j=0;j<tv;j++)for(let i=0;i<tv;i++){
+   const gx=tx*TC+i,gz=tz*TC+j,x=-WORLD+gx*TSTEP,z=-WORLD+gz*TSTEP,y=H[gz*NG+gx],k=(j*tv+i)*3;
+   const x0=Math.max(0,gx-1),x1=Math.min(NG-1,gx+1),z0=Math.max(0,gz-1),z1=Math.min(NG-1,gz+1);
+   const sx=-(H[gz*NG+x1]-H[gz*NG+x0])/((x1-x0)*TSTEP),sz=-(H[z1*NG+gx]-H[z0*NG+gx])/((z1-z0)*TSTEP),l=Math.hypot(sx,1,sz);
+   pos[k]=x;pos[k+1]=y;pos[k+2]=z;nor[k]=sx/l;nor[k+1]=1/l;nor[k+2]=sz/l;
+   const sh=.92+Math.sin(x*.017+z*.013)*.035,c=terrainCol(x,y,z);col[k]=c[0]*sh;col[k+1]=c[1]*sh;col[k+2]=c[2]*sh;
+  }
+  const g=new THREE.BufferGeometry();
+  g.setAttribute('position',new THREE.BufferAttribute(pos,3));g.setAttribute('normal',new THREE.BufferAttribute(nor,3));g.setAttribute('color',new THREE.BufferAttribute(col,3));
+  g.setIndex(new THREE.BufferAttribute(idx,1));g.computeBoundingSphere();
+  const m=new THREE.Mesh(g,terrainMat);m.receiveShadow=true;m.castShadow=false;scene.add(m);
+ }
+}
+// ---- Road mesh: asphalt ribbons, lane markings, sidewalks and footpaths laid just above the flat road ground. Visual only; same grip as the ground. ----
+const roadFloats=[];
+{
+ const WHITE=[.80,.80,.76],YEL=[.85,.64,.10],WALK=[.46,.46,.44];
+ const quad=(a,b,c,d,col,dy)=>{for(const p of [a,b,c,a,c,d])roadFloats.push(p[0],groundHeight(p[0],p[2])+dy,p[2],col[0],col[1],col[2]);};
+ const near=(self,x,z,extra)=>{for(const r of ROADS)if(r!==self&&roadDistTo(r,x,z)<R_CLS[r.cls].w/2+extra)return true;return false;};
+ function poly(r){const p=[];
+  if(r.k==='s'){const n=Math.max(1,Math.round(Math.hypot(r.x1-r.x0,r.z1-r.z0)/4));for(let i=0;i<=n;i++)p.push([r.x0+(r.x1-r.x0)*i/n,r.z0+(r.z1-r.z0)*i/n]);}
+  else{const n=Math.max(8,Math.round(2*Math.PI*r.R/4));for(let i=0;i<=n;i++){const a=i/n*Math.PI*2;p.push([r.cx+Math.cos(a)*r.R,r.cz+Math.sin(a)*r.R]);}}
+  return p;}
+ for(const r of ROADS){
+  const C=R_CLS[r.cls],p=poly(r),L=p.length,nm=[];
+  for(let i=0;i<L;i++){const a=p[Math.max(0,i-1)],b=p[Math.min(L-1,i+1)],dx=b[0]-a[0],dz=b[1]-a[1],l=Math.hypot(dx,dz)||1;nm.push([-dz/l,dx/l]);}
+  const off=(i,o)=>[p[i][0]+nm[i][0]*o,0,p[i][1]+nm[i][1]*o];
+  const strip=(i,o,w,col,dy)=>quad(off(i,o-w/2),off(i,o+w/2),off(i+1,o+w/2),off(i+1,o-w/2),col,dy);
+  for(let i=0;i<L-1;i++){
+   const mx=(p[i][0]+p[i+1][0])/2,mz=(p[i][1]+p[i+1][1])/2;
+   strip(i,0,C.w,C.asph,C.dy);
+   if(r.cls==='pa')continue;
+   if(!near(r,mx,mz,.8)){   // markings stop at junctions
+    if(r.cls==='hw'){for(const sg of [-1,1]){strip(i,sg*10.2,.2,WHITE,C.dy+.015);strip(i,sg*.3,.14,YEL,C.dy+.015);if(i%2===0)strip(i,sg*5.5,.14,WHITE,C.dy+.015);}}
+    else{for(const sg of [-1,1])strip(i,sg*4.4,.16,WHITE,C.dy+.015);if(i%2===0)strip(i,0,.14,WHITE,C.dy+.015);}
+   }
+   if(r.cls==='st'&&!near(r,mx,mz,3)){for(const sg of [-1,1])strip(i,sg*(5+1.25),2.5,WALK,C.dy+.03);}   // sidewalks
+  }
+ }
+}
+// ---- Road mesh (asphalt, markings, sidewalks): triangles binned per tile so three.js can cull them; wound to face up ----
+{
+ const bins=new Map(),F=roadFloats;
+ for(let i=0;i+17<F.length;i+=18){
+  const cx=(F[i]+F[i+6]+F[i+12])/3,cz=(F[i+2]+F[i+8]+F[i+14])/3,key=tileAt(cx,cz);
+  let a=bins.get(key);if(!a){a=[];bins.set(key,a);}
+  const cy=(F[i+8]-F[i+2])*(F[i+12]-F[i])-(F[i+6]-F[i])*(F[i+14]-F[i+2]);   // sign of the triangle's upward-facing area
+  const o=cy>0?[0,6,12]:[0,12,6];
+  for(const v of o)for(let k=0;k<6;k++)a.push(F[i+v+k]);
+ }
+ const roadMat=new THREE.MeshLambertMaterial({vertexColors:true,polygonOffset:true,polygonOffsetFactor:-2,polygonOffsetUnits:-4});
+ for(const a of bins.values()){
+  const n=a.length/6,pos=new Float32Array(n*3),col=new Float32Array(n*3),nor=new Float32Array(n*3);
+  for(let v=0;v<n;v++){pos[v*3]=a[v*6];pos[v*3+1]=a[v*6+1];pos[v*3+2]=a[v*6+2];col[v*3]=a[v*6+3];col[v*3+1]=a[v*6+4];col[v*3+2]=a[v*6+5];nor[v*3+1]=1;}
+  const g=new THREE.BufferGeometry();g.setAttribute('position',new THREE.BufferAttribute(pos,3));g.setAttribute('color',new THREE.BufferAttribute(col,3));g.setAttribute('normal',new THREE.BufferAttribute(nor,3));g.computeBoundingSphere();
+  const m=new THREE.Mesh(g,roadMat);m.receiveShadow=true;scene.add(m);
+ }
+}
+// ---- Ocean (CPU): animated wave grid south of the beach. Swell, shoreline swash/foam, whitecaps, and ripples + foam wake from the car. ----
+const SEA=-.6,WX0=-1000,WZ0=930,WD=2.5,WNX=801,WNZ=81,WNV=WNX*WNZ,WZ1=WZ0+(WNZ-1)*WD;
+const wTh=new Float32Array(WNV),wV=new Float32Array(WNV*8),hA=new Float32Array(WNV),gA=new Float32Array(WNV),zA=new Float32Array(WNV),fA=new Float32Array(WNV),wake=[];
+const WVa=[[.15,-1,.285,1.67,.09,0],[-.35,-1,.52,2.26,.05,1.3],[.8,-.6,.9,2.97,.02,2.1]].map(w=>{const l=Math.hypot(w[0],w[1]);w[0]/=l;w[1]/=l;return w;}).flat();   // dx,dz,k,omega,amp,phase (swell travels toward the beach)
+for(let iz=0;iz<WNZ;iz++)for(let ix=0;ix<WNX;ix++){const v=iz*WNX+ix,x=WX0+ix*WD,z=WZ0+iz*WD;wTh[v]=groundHeight(x,z);wV[v*8]=x;wV[v*8+2]=z;}
+const wDp=new Float32Array(WNV),wK=new Float32Array(WNV),wSw=new Float32Array(WNV),wUb=new Float32Array(WNV),wWsh=new Float32Array(WNV),wSb=new Float32Array(WNV*3),wCb=new Float32Array(WNV*3);
+for(let v=0;v<WNV;v++){   // static per-vertex values, computed once instead of every frame
+ const x=wV[v*8],z=wV[v*8+2],dep0=SEA-wTh[v],edge=_ss(0,14,Math.min(x-WX0,-WX0-x,WZ1-z));
+ wDp[v]=_ss(994,1006,z)*8;wK[v]=(1+1.4*(1-_ss(0,3,dep0)))*edge;wWsh[v]=1-_ss(0,4,dep0);wSw[v]=(.08+.42*wWsh[v])*edge;wUb[v]=z/6+x*.01+Math.sin(x*.05)*1.5;
+ for(let j=0;j<3;j++){const b=WVa[j*6+2]*(WVa[j*6]*x+WVa[j*6+1]*z)+WVa[j*6+5];wSb[j*WNV+v]=Math.sin(b);wCb[j*WNV+v]=Math.cos(b);}}
+
+// ---- Persistent foam grid around the player/car: 128x128 cells of 0.5 m, wraps like a torus so it never has to be copied when the car moves.
+// Each frame: everything decays, nearby foam is pushed outward from the hull (semi-Lagrangian), then the hull deposits a new bow crescent, flank streams and a turbulent trail.
+// Uploaded as one 16 KB luminance texture and sampled per pixel, so wake foam is 5x finer than the 2.5 m water mesh. ----
+const FGN=128,FGC=.5;let fgA=new Float32Array(FGN*FGN),fgB=new Float32Array(FGN*FGN),fgLive=false;const fgU8=new Uint8Array(FGN*FGN),wPf=new Float32Array(WNV);
+function updateFoam(dt,sx,sz,fx,fz,sp,wet,hl,hw){
+ const N=FGN,M=N-1,C=FGC,dep=wet>.05;
+ if(!dep&&!fgLive)return;
+ let A=fgA,B=fgB;const dec=Math.exp(-dt*.5),sub=dt*.05;
+ for(let i=0;i<N*N;i++){const f=A[i]*dec-sub;B[i]=f>0?f:0;}   // fade: multiplicative + a small constant so thin foam dies fully instead of lingering forever
+ const cx=Math.floor(sx/C),cz=Math.floor(sz/C),RA=24,u0=Math.min(3,.7+.12*sp);
+ for(let iz=cz-RA;iz<=cz+RA;iz++)for(let ix=cx-RA;ix<=cx+RA;ix++){   // push foam away from the hull: the water the bow shoulders aside carries foam with it
+  const px=(ix+.5)*C,pz=(iz+.5)*C,rx=px-sx,rz=pz-sz,r=Math.hypot(rx,rz);if(r<1.2||r>RA*C)continue;
+  const w=(r-1.2)/2.3,u=u0*Math.exp(-r/9)*(w>=1?1:w*w*(3-2*w))*dt/r,gx=(px-rx*u)/C-.5,gz=(pz-rz*u)/C-.5,x0=Math.floor(gx),z0=Math.floor(gz),tx=gx-x0,tz=gz-z0,
+   a=(z0&M)<<7,b=((z0+1)&M)<<7,xa=x0&M,xb=(x0+1)&M,f=((A[a|xa]*(1-tx)+A[a|xb]*tx)*(1-tz)+(A[b|xa]*(1-tx)+A[b|xb]*tx)*tz)*dec-sub;
+  B[((iz&M)<<7)|(ix&M)]=f>0?f:0;}
+ if(dep){
+  const S0=wet*Math.min(1,(sp+1.5)/9),k=Math.min(1,dt*10),RD=16;
+  for(let iz=cz-RD;iz<=cz+RD;iz++)for(let ix=cx-RD;ix<=cx+RD;ix++){
+   const rx=(ix+.5)*C-sx,rz=(iz+.5)*C-sz,a=rx*fx+rz*fz,b=Math.abs(-rx*fz+rz*fx);let d=0;
+   const e=Math.hypot(a/(hl+.45),b/(hw+.35)),q=(e-1)/.3;   // bow: foam hugging the hull outline, thickest at the nose
+   if(q<3){const t=a/hl,bs=t<-.6?0:t>.9?1:(t+.6)/1.5;d=Math.exp(-q*q)*(.35+.65*bs*bs*(3-2*bs));}
+   if(a<hl+.2&&a>-7.5){const ex=Math.max(0,hl-a),q2=(b-(hw+.3+ex*.2))/.55;if(q2<3){const v=Math.exp(-q2*q2-ex/4.5)*.85;if(v>d)d=v;}}   // flank streams peeling back in a V
+   if(a<0){const ar=-a,w=1+ar*.14,q3=b/w;if(q3<3){const v=Math.exp(-q3*q3-ar/6)*.55;if(v>d)d=v;}}   // turbulent trail behind
+   d*=S0;if(d<.01)continue;const i=((iz&M)<<7)|(ix&M),f=B[i];if(d>f)B[i]=f+(d-f)*k;}
+ }
+ let mx=0;for(let i=0;i<N*N;i++){const v=B[i];if(v>mx)mx=v;fgU8[i]=v>=1?255:(v*255)|0;}
+ fgLive=mx>.004;fgA=B;fgB=A;
+ foamTex.needsUpdate=true;
+}
+let wLast=0;const _CT=[0,0,0],_ST=[0,0,0];
+function updateWater(t,dt,vx0,vx1,vz0,vz1){   // vertex range = only the part of the sea near the camera
+ const occ=car.occupied,sx=occ?car.x:player.x,sz=occ?car.z:player.z,sp=occ?Math.abs(car.vl):Math.hypot(pvx,pvz),wet=_ss(-.4,-1.0,groundHeight(sx,sz));
+ for(const p of wake)p.age+=dt;
+ while(wake.length&&wake[0].age>4.5)wake.shift();
+ const hn=occ?1:Math.hypot(pvx,pvz),hx=occ?-Math.sin(car.yaw)*(car.vl<0?-1:1):(hn>.05?pvx/hn:0),hz=occ?-Math.cos(car.yaw)*(car.vl<0?-1:1):(hn>.05?pvz/hn:-1);
+ if(wet>.05&&sz>WZ0-5){const l=wake[wake.length-1];if(!l||Math.hypot(l.x-sx,l.z-sz)>.8||l.age>.45){wake.push({x:sx,z:sz,age:0,s:Math.min(1,(sp+2)/10)*wet});if(wake.length>45)wake.shift();}}
+ updateFoam(dt,sx,sz,hx,hz,sp,wet>.05&&sz>WZ0-5?wet:0,occ?2.1:.35,occ?1:.35);
+ hA.fill(0);gA.fill(0);zA.fill(0);
+ const S=.15+.85*_ss(.35,.9,.5+.5*Math.sin(t*.21+1));   // set strength: calm spells and bigger groups of waves
+ for(const p of wake){   // each wake point sheds an expanding ring and leaves a patch of foam that fades
+  const r=p.age*3.4,amp=.13*p.s*Math.exp(-p.age/2.4)/(1+r*.15),R=Math.ceil((r+4.5)/WD),cx=Math.round((p.x-WX0)/WD),cz=Math.round((p.z-WZ0)/WD);
+  for(let iz=Math.max(0,cz-R);iz<=Math.min(WNZ-1,cz+R);iz++)for(let ix=Math.max(0,cx-R);ix<=Math.min(WNX-1,cx+R);ix++){
+   const dx=WX0+ix*WD-p.x,dz=WZ0+iz*WD-p.z,dd=Math.hypot(dx,dz),d=dd-r,v=iz*WNX+ix;
+   if(Math.abs(d)<4&&dd>.01){const u=d/1.3,env=Math.exp(-u*u),ph=d*2.6,cs=Math.cos(ph),sn=Math.sin(ph),dR=amp*env*(-2*u/1.3*cs-2.6*sn);hA[v]+=amp*env*cs;gA[v]+=dR*dx/dd;zA[v]+=dR*dz/dd;}
+  }}
+ const pfd=Math.exp(-dt*.9),CT=_CT,ST=_ST;for(let j=0;j<3;j++){CT[j]=Math.cos(WVa[j*6+3]*t);ST[j]=Math.sin(WVa[j*6+3]*t);}   // sin/cos of (b - w t) from precomputed sin/cos of b
+ for(let iz=vz0;iz<=vz1;iz++)for(let ix=vx0;ix<=vx1;ix++){
+  const v=iz*WNX+ix,o=v*8,th=wTh[v],k=wK[v],wsh=wWsh[v];
+  let h=0,gx=0,gz=0,Pc=0;
+  for(let j=0;j<3;j++){const sb=wSb[j*WNV+v],cb=wCb[j*WNV+v],A=WVa[j*6+4],sn=sb*CT[j]-cb*ST[j],cs=(cb*CT[j]+sb*ST[j])*A*WVa[j*6+2];h+=A*sn;Pc+=A*WVa[j*6+2]*sn;gx+=cs*WVa[j*6];gz+=cs*WVa[j*6+1];}
+  // Wave sets: every ~9 s a bore (sharp front, slow decay) runs toward the beach at ~6 m/s and surges up the sand, then drains back. S makes some sets bigger than others.
+  let u=(t+wUb[v])/9;u-=Math.floor(u);
+  const P=_ss(0,.18,u)*(1-_ss(.18,.85,u)),surge=P*S*wSw[v];
+  const hh=h*k+hA[v]+surge,dl=SEA+hh-th;
+  // Foam only where something makes it: the breaking front of a bore and its fading trail in the shallows, a thin line at the leading edge of the water on the sand,
+  // occasional whitecaps on steep waves in shallow water, and the car's wake.
+  const front=_ss(0,.03,u)*(1-_ss(.03,.12,u)),trail=_ss(.03,.1,u)*(1-_ss(.1,.34,u))*.3,wb=(1-_ss(.8,4.5,dl))*_ss(0,.05,dl)*wsh;
+  const bore=S*(front+trail)*wb,lip=(1-_ss(.01,.25,dl))*_ss(-.02,.02,dl)*S*Math.min(1,front*1.4+trail*.6),cap0=_ss(.04,.075,Pc*k*(.55+.45*S))*(1-_ss(1.5,3.8,dl))*_ss(.05,.2,dl),cap=Math.max(wPf[v]*pfd,cap0);wPf[v]=cap;   // crest pinch (sharp, compressed crests) starts foam; it then lingers and decays behind the crest like Tessendorf's accumulate/dissipate   // cap: rare, only the steepest waves in shallow water
+  wV[o+1]=Math.max(SEA+hh,th+.012);                         // never below the sand: the water surface ends exactly at the beach, no clipping
+  wV[o+3]=Math.min(1,bore+lip+cap*.8);wV[o+4]=Math.max(dl,0)+wDp[v];wV[o+5]=cap;
+  wV[o+6]=-(gx*k+gA[v]);wV[o+7]=-(gz*k+zA[v]);
+ }
+}
+
+// ---- Ocean (three.js): the CPU wave/foam simulation above feeds a compact camera-centred mesh drawn with the water shader below ----
+const foamTex=new THREE.DataTexture(fgU8,FGN,FGN,THREE.RedFormat,THREE.UnsignedByteType);
+foamTex.wrapS=foamTex.wrapT=THREE.RepeatWrapping;foamTex.magFilter=foamTex.minFilter=THREE.LinearFilter;foamTex.generateMipmaps=false;foamTex.needsUpdate=true;
+// ---- Baked water detail texture (256x256 RGBA, tileable, built once at load): R,G = ripple slope; B = foam patch noise; A = foam bubble cells ----
+const wdTex=(()=>{const N=256,d=new Uint8Array(N*N*4),H=new Float32Array(N*N),Bn=new Float32Array(N*N);
+ const hs=(x,y,q)=>{let h=(Math.imul(x,374761393)+Math.imul(y,668265263)+Math.imul(q,1274126177))|0;h=Math.imul(h^(h>>>13),1274126177);return((h^(h>>>16))>>>0)/4294967296;};
+ const mk=(c,q)=>{const t=new Float32Array(c*c*2);for(let j=0;j<c;j++)for(let i=0;i<c;i++){const a=hs(i,j,q)*6.2832;t[(j*c+i)*2]=Math.cos(a);t[(j*c+i)*2+1]=Math.sin(a);}return{c,t};};
+ const gn2=(o,u,v)=>{const c=o.c,t=o.t,x=u*c,y=v*c,ix=x|0,iy=y|0,fx=x-ix,fy=y-iy,sx=fx*fx*fx*(fx*(fx*6-15)+10),sy=fy*fy*fy*(fy*(fy*6-15)+10),i1=(ix+1)%c,j1=(iy+1)%c;
+  const q=(i,j,dx,dy)=>t[(j*c+i)*2]*dx+t[(j*c+i)*2+1]*dy,a=q(ix,iy,fx,fy),b=q(i1,iy,fx-1,fy),e=q(ix,j1,fx,fy-1),f=q(i1,j1,fx-1,fy-1),top=a+(b-a)*sx;return top+((e+(f-e)*sx)-top)*sy;};
+ const o1=mk(4,1),o2=mk(10,2),o3=mk(22,3),b1=mk(3,4),b2=mk(6,5),b3=mk(12,6),b4=mk(24,7);
+ for(let y=0;y<N;y++)for(let x=0;x<N;x++){const u=x/N,v=y/N,i=y*N+x;H[i]=gn2(o1,u,v)+gn2(o2,u,v)*.5+gn2(o3,u,v)*.22;Bn[i]=gn2(b1,u,v)*.5+gn2(b2,u,v)*.25+gn2(b3,u,v)*.125+gn2(b4,u,v)*.0625;}
+ const hv=(x,y)=>H[((y+N)%N)*N+((x+N)%N)],gx=new Float32Array(N*N),gy=new Float32Array(N*N);let sq=0;
+ for(let y=0;y<N;y++)for(let x=0;x<N;x++){const i=y*N+x;gx[i]=hv(x+1,y)-hv(x-1,y);gy[i]=hv(x,y+1)-hv(x,y-1);sq+=gx[i]*gx[i]+gy[i]*gy[i];}
+ const sc=.18/(Math.sqrt(sq/(2*N*N))||1),cl=v=>Math.max(0,Math.min(255,Math.round(v))),sm=(a,b,x)=>{x=Math.min(1,Math.max(0,(x-a)/(b-a)));return x*x*(3-2*x);};
+ const W=24,px=new Float32Array(W*W),py=new Float32Array(W*W);for(let i=0;i<W*W;i++){px[i]=hs(i%W,(i/W)|0,8);py[i]=hs(i%W,(i/W)|0,9);}
+ for(let y=0;y<N;y++)for(let x=0;x<N;x++){const i=y*N+x,wx=x/N*W,wy=y/N*W,ix=Math.floor(wx),iy=Math.floor(wy);let m=9;
+  for(let dj=-1;dj<=1;dj++)for(let di=-1;di<=1;di++){const k=((iy+dj+W)%W)*W+((ix+di+W)%W),ex=ix+di+px[k]-wx,ey=iy+dj+py[k]-wy,dd=ex*ex+ey*ey;if(dd<m)m=dd;}
+  d[i*4]=cl(127.5+255*sc*gx[i]);d[i*4+1]=cl(127.5+255*sc*gy[i]);d[i*4+2]=cl(255*(.5+.85*Bn[i]));d[i*4+3]=cl(255*(1-sm(.1,.8,Math.sqrt(m))));}
+ const t=new THREE.DataTexture(d,N,N,THREE.RGBAFormat,THREE.UnsignedByteType);t.wrapS=t.wrapT=THREE.RepeatWrapping;t.magFilter=THREE.LinearFilter;t.minFilter=THREE.LinearMipmapLinearFilter;t.generateMipmaps=true;t.needsUpdate=true;return t;})();
+const waterU={uCam:{value:new THREE.Vector3()},uT:{value:0},uSun:{value:new THREE.Vector3(0,1,0)},uSunCol:{value:new THREE.Vector3(1,1,1)},uHor:{value:new THREE.Vector3()},uZen:{value:new THREE.Vector3()},uFog:{value:new THREE.Vector3()},uFogD:{value:.0011},uFoam:{value:foamTex},uWD:{value:wdTex},uFC:{value:new THREE.Vector2()}};
+const WVS='attribute vec3 aInfo;attribute vec2 aNrm;varying vec3 vW;varying vec3 vI;varying vec2 vN;void main(){vW=position;vI=aInfo;vN=aNrm;gl_Position=projectionMatrix*viewMatrix*vec4(position,1.0);}';
+const WFS=`uniform vec3 uSun,uSunCol,uHor,uZen,uFog;uniform float uFogD;
+vec3 hemi(vec3 n){float t=n.y*.5+.5;vec3 sky=mix(uHor,uZen,.45)*.9,gnd=vec3(.30,.27,.20)*(.12+uSunCol*.55);return mix(gnd,sky,t*t*(3.0-2.0*t))+uHor*(1.0-abs(n.y))*.22;}
+vec3 applyFog(vec3 c,vec3 d,float wy){float dist=length(d);return mix(c,uFog,1.0-exp(-uFogD*uFogD*dist*dist));}   // same exponential-squared fog as the rest of the scene
+varying vec3 vW;varying vec3 vI;varying vec2 vN;uniform vec3 uCam;uniform float uT;uniform sampler2D uFoam,uWD;uniform vec2 uFC;
+// Noise: smooth gradient noise (no visible grid) with a rotated fbm. ripple() is the fine surface detail; k fades its small octaves with distance.
+vec2 h22(vec2 p){vec3 q=fract(vec3(p.xyx)*vec3(.1031,.1030,.0973));q+=dot(q,q.yzx+33.33);return fract((q.xx+q.yz)*q.zy)*2.0-1.0;}
+float gn(vec2 p){vec2 i=floor(p),f=fract(p),u=f*f*f*(f*(f*6.0-15.0)+10.0);
+ return mix(mix(dot(h22(i),f),dot(h22(i+vec2(1.0,0.0)),f-vec2(1.0,0.0)),u.x),mix(dot(h22(i+vec2(0.0,1.0)),f-vec2(0.0,1.0)),dot(h22(i+vec2(1.0,1.0)),f-vec2(1.0,1.0)),u.x),u.y);}
+const mat2 ROT=mat2(.8,.6,-.6,.8);
+void main(){
+ vec2 p=vW.xz;vec3 vv=uCam-vW;float dist=length(vv);vec3 V=vv/dist;
+ float k=1.0-smoothstep(30.0,160.0,dist),far=1.0-smoothstep(120.0,700.0,dist);
+ // Ripples: two scrolling samples of the baked slope map (fine layer fades out by 160 m, coarse layer by 400 m); nothing is computed past 400 m
+ float wR=1.0-smoothstep(250.0,400.0,dist);vec2 rp=vec2(0.0);
+ if(wR>0.0){vec2 s=(texture2D(uWD,ROT*p*.046+vec2(-uT*.012,uT*.009)).rg-.5)*5.5556*ROT*.8;
+  if(k>0.0)s+=(texture2D(uWD,p*.125+vec2(uT*.045,uT*.028)).rg-.5)*5.5556*.75*k;
+  rp=-s*.03*wR*(.25+.75*far);}
+ vec3 n=normalize(vec3(vN.x+rp.x,1.0,vN.y+rp.y));
+ float fr=.03+.97*pow(1.0-max(dot(n,V),0.0),4.0);
+ vec3 R=reflect(-V,n);R.y=abs(R.y);
+ vec3 skyc=mix(uHor,uZen,pow(clamp(R.y,0.0,1.0),.5))*.95;
+ float dep=vI.y;
+ vec3 lit=hemi(n)*.8+uSunCol*(.35+.65*max(dot(n,uSun),0.0))*.55;   // light reaching the water: bright by day, dark at night
+ float tw=1.0-exp(-dep*.22);   // how much water the view ray passes through: shallow = see-through, deep = opaque
+ vec3 body=mix(vec3(.12,.57,.57),vec3(.018,.22,.39),1.0-exp(-dep*.24))*lit;   // turquoise shallows fading to deep blue
+ vec3 c=mix(body,skyc,fr);
+ float a=(tw+(1.0-tw)*fr*.85)*smoothstep(0.0,.06,dep);
+ c+=uSunCol*pow(max(dot(R,uSun),0.0),200.0)*3.5;
+ float sh=1.0-smoothstep(.15,2.6,dep);   // caustics: sun light bundled by the waves, drifting over the sand in the shallows only
+ if(sh>.01&&uSun.y>.05){float c1=1.0-clamp(abs(gn(p*1.7+vec2(uT*.31,uT*.19)))*2.2,0.0,1.0),c2=1.0-clamp(abs(gn(p*2.5-vec2(uT*.26,-uT*.33)+5.0))*2.2,0.0,1.0);
+  float cw=min(.22,pow(c1*c2,4.0)*sh*.9*clamp(uSun.y*1.5,0.0,1.0)*(1.0-fr));c=mix(c,vec3(.95,.97,.9)*(.55+.45*clamp(uSunCol,0.0,1.0)),cw);a=max(a,cw*.85);}
+ float F=clamp(vI.x,0.0,1.0),cr=clamp(vI.z,0.0,1.0);
+ vec2 fq=p-uFC;float Ft=texture2D(uFoam,p*.015625).r*(1.0-smoothstep(22.0,28.0,max(abs(fq.x),abs(fq.y))));   // persistent wake foam (128x128 grid, 0.5 m cells)
+ float D=max(max(F,Ft),(1.0-smoothstep(.05,.45,dep))*.62);   // shoreline fringe: a lacy foam line wherever the water is under ~0.45 m deep (breaks up and drifts via the flow-mapped bubbles below)
+ if(D>.01||cr>.01){   // foam: density gets broken up by soft patches plus fine bubbles, so thin foam fades into lace instead of switching off
+ float fine=.5,nz=0.0;   // foam breakup comes from the baked texture and is skipped past 400 m (plain smooth foam there)
+  if(dist<400.0){float wF=1.0-smoothstep(260.0,400.0,dist);
+   vec4 w2=texture2D(uWD,ROT*p*.046+vec2(-uT*.002,uT*.003));
+   // flow map: foam drifts toward the beach, slows and bunches up in the shallows, and churns using the slope map; two phases half a cycle apart hide each reset
+   vec2 fo=(vec2(.148,-.989)*(.12+.5*smoothstep(0.0,3.0,dep))+(w2.rg-.5)*1.4)*.5;
+   float ph=uT*.25,p0=fract(ph),p1=fract(ph+.5),q0=1.0-abs(1.0-2.0*p0);
+   vec2 uv=p*.125+vec2(uT*.004,-uT*.003);
+   vec4 wm=mix(texture2D(uWD,uv+vec2(.37,.61)-fo*p1),texture2D(uWD,uv-fo*p0),q0);
+   fine=mix(.5,wm.a,wF);nz=((wm.b-.5)+(w2.b-.5)*.6)*1.21*wF+(fine-.5)*.35;}
+  float fm=smoothstep(.3,.55,D*1.1+nz*.45)*smoothstep(0.0,.1,D);
+  fm=max(fm,smoothstep(.3,.55,cr*1.1+nz*.45)*smoothstep(0.0,.2,cr));
+  vec3 fcol=vec3(.94,.97,.98)*(.88+.12*fine)*(hemi(n)*.75+uSunCol*max(dot(n,uSun),0.0)*.7);
+  float ff=fm*mix(.28,1.0,smoothstep(.5,.85,max(D,cr)));   // dense front = solid white, thin trailing foam = faint and see-through
+  c=mix(c,fcol,ff);a=max(a,ff*.96);}
+ c=applyFog(c,-vv,vW.y);
+ gl_FragColor=vec4(c,a);}`;
+const waterMat=new THREE.ShaderMaterial({uniforms:waterU,vertexShader:WVS,fragmentShader:WFS,transparent:true,depthWrite:false,side:THREE.DoubleSide,polygonOffset:true,polygonOffsetFactor:-1,polygonOffsetUnits:-2});
+const WWMAX=128;   // camera window is at most ~126 vertices across
+const winArr=new Float32Array(WWMAX*WWMAX*8),winBuf=new THREE.InterleavedBuffer(winArr,8),winIdx=new Uint16Array((WWMAX-1)*(WWMAX-1)*6),idxAttr=new THREE.BufferAttribute(winIdx,1);
+winBuf.setUsage(THREE.DynamicDrawUsage);idxAttr.setUsage(THREE.DynamicDrawUsage);
+const wGeo=new THREE.BufferGeometry();
+wGeo.setAttribute('position',new THREE.InterleavedBufferAttribute(winBuf,3,0));wGeo.setAttribute('aInfo',new THREE.InterleavedBufferAttribute(winBuf,3,3));wGeo.setAttribute('aNrm',new THREE.InterleavedBufferAttribute(winBuf,2,6));
+wGeo.setIndex(idxAttr);wGeo.setDrawRange(0,0);
+const waterMesh=new THREE.Mesh(wGeo,waterMat);waterMesh.frustumCulled=false;waterMesh.renderOrder=1;waterMesh.visible=false;scene.add(waterMesh);
+{   // flat deep ocean around the wave grid, out to the horizon
+ const P=[],I=[],N=[],q=(x0,z0,x1,z1)=>{for(const [x,z] of [[x0,z0],[x1,z0],[x1,z1],[x0,z0],[x1,z1],[x0,z1]]){P.push(x,SEA,z);I.push(0,14,0);N.push(0,0);}};
+ q(WX0,WZ1,-WX0,6000);q(-6000,WZ0,WX0,6000);q(-WX0,WZ0,6000,6000);
+ const g=new THREE.BufferGeometry();g.setAttribute('position',new THREE.Float32BufferAttribute(P,3));g.setAttribute('aInfo',new THREE.Float32BufferAttribute(I,3));g.setAttribute('aNrm',new THREE.Float32BufferAttribute(N,2));
+ const m=new THREE.Mesh(g,waterMat);m.frustumCulled=false;m.renderOrder=1;scene.add(m);
+}
+let wKey='';
+function updateWaterMesh(){
+ const t=performance.now()*.001,dt=Math.min(.05,t-(wLast||t));wLast=t;
+ const cx=(camPos[0]-WX0)/WD,cz=(camPos[2]-WZ0)/WD,rc=62,x0=Math.max(0,Math.floor(cx-rc)),x1=Math.min(WNX-2,Math.ceil(cx+rc)),z0=Math.max(0,Math.floor(cz-rc)),z1=Math.min(WNZ-2,Math.ceil(cz+rc)),any=x1>=x0&&z1>=z0;
+ updateWater(t,dt,x0,any?x1+1:-1,z0,any?z1+1:-1);
+ const u=waterU;u.uCam.value.set(camPos[0],camPos[1],camPos[2]);u.uT.value=t;u.uFC.value.set(camPos[0],camPos[2]);
+ u.uSun.value.set(SUNN[0],SUNN[1],SUNN[2]);u.uSunCol.value.set(SKY.sc[0],SKY.sc[1],SKY.sc[2]);u.uHor.value.set(SKY.hor[0],SKY.hor[1],SKY.hor[2]);u.uZen.value.set(SKY.zen[0],SKY.zen[1],SKY.zen[2]);u.uFog.value.set(SKY.fog[0],SKY.fog[1],SKY.fog[2]);
+ waterMesh.visible=any;if(!any)return;
+ const nx=x1-x0+2,nz=z1-z0+2,key=x0+','+x1+','+z0+','+z1;
+ if(key!==wKey){let n=0;for(let iz=0;iz<nz-1;iz++)for(let ix=0;ix<nx-1;ix++){const v=iz*nx+ix;winIdx[n++]=v;winIdx[n++]=v+1;winIdx[n++]=v+nx;winIdx[n++]=v+1;winIdx[n++]=v+nx+1;winIdx[n++]=v+nx;}
+  idxAttr.needsUpdate=true;wGeo.setDrawRange(0,n);wKey=key;}   // index list only rebuilt when the camera crosses a cell
+ for(let iz=0;iz<nz;iz++){const a=((z0+iz)*WNX+x0)*8;winArr.set(wV.subarray(a,a+nx*8),iz*nx*8);}
+ winBuf.needsUpdate=true;
+}
+
+const keys=new Set(), player={x:7.8,y:1.7,z:42.5,r:.34};let yaw=0,pitch=0,vy=0,grounded=true,locked=false;
+let G=9.80665;const DRAG_K=9.80665/(55*55);let pvx=0,pvz=0,landDip=0;
+const car={x:7.8,y:.36,z:40,yaw:0,speed:0,steer:0,vl:0,vr:0,w:0,pitch:0,roll:0,pitchV:0,rollV:0,vy:0,spinF:0,spinR:0,brakeLit:false,occupied:false,engineDamage:0,steeringDamage:0,tireDamage:0,steeringPull:0};
+
+let cameraMode='walk',driveCameraYaw=0,driveOrbitYaw=0,driveOrbitPitch=-0.38;
+// ---- Look state: live time of day (sun direction + sky colours), cockpit camera, speed FOV, shake ----
+let tod=9.5,todAuto=true,cockpit=false,headYaw=0,headPitch=0,lastMouseT=0,shakeAmt=0,fovCur=74;
+const SUNN=[.45,.8,.35],SKY={hor:[.88,.92,.96],zen:[.18,.38,.78],fog:[.36,.46,.55],sc:[1,.95,.85],tint:[1,1,1],night:0};
+function sstep(a,b,x){const t=Math.max(0,Math.min(1,(x-a)/(b-a)));return t*t*(3-2*t);}
+// Sky colour keys as [day, dusk, night]; setSun() blends them in place so no arrays are allocated per frame.
+const SKY_KEYS=['hor','zen','fog','sc','tint'],SKY_K={hor:[[.88,.92,.96],[1.0,.58,.32],[.10,.13,.22]],zen:[[.18,.38,.78],[.30,.36,.62],[.02,.03,.07]],
+ fog:[[.36,.46,.55],[.62,.42,.32],[.035,.045,.08]],sc:[[1,.95,.85],[1,.55,.25],[.26,.34,.58]],tint:[[1,1,1],[1.07,.97,.88],[.88,.96,1.12]]},_hs=[0,0,0];
+function setSun(){
+ const a=(tod-6)/12*Math.PI,sn=Math.sin(a),cs=Math.cos(a);
+ const x=cs*.85,y=Math.max(sn,0)*.86+.12,z=.38,l=Math.hypot(x,y,z);SUNN[0]=x/l;SUNN[1]=y/l;SUNN[2]=z/l;
+  const day=sstep(.08,.5,sn),lit=sstep(-.18,.06,sn);
+ for(let j=0;j<SKY_KEYS.length;j++){const K=SKY_K[SKY_KEYS[j]],o=SKY[SKY_KEYS[j]],d=K[0],u=K[1],n=K[2];
+  for(let i=0;i<3;i++){const m=u[i]+(d[i]-u[i])*day;o[i]=n[i]+(m-n[i])*lit;}}
+ SKY.night=1-lit;
+}
+setSun();
+const _sk=[0,0,0];
+function shakeOff(){if(shakeAmt<.003){_sk[0]=_sk[1]=_sk[2]=0;return _sk;}const t=performance.now()*.001,a=shakeAmt*.07;_sk[0]=Math.sin(t*47)*a;_sk[1]=Math.sin(t*61+1.3)*a;_sk[2]=Math.sin(t*53+2.1)*a;return _sk;}
+function identity(){return new Float32Array([1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1]);}
+function modelMatrix(o){const m=identity(),a=o.yaw||0,c=Math.cos(a),s=Math.sin(a);m[0]=c*o.w;m[2]=-s*o.w;m[5]=o.h;m[8]=s*o.d;m[10]=c*o.d;m[12]=o.x;m[13]=o.y;m[14]=o.z;return m;}
+// 3x3 rotation helpers. Each takes an optional output array; the per-frame render path passes scratch arrays so nothing is allocated.
+function rotY(a,o=new Array(9)){const c=Math.cos(a),s=Math.sin(a);o[0]=c;o[1]=0;o[2]=-s;o[3]=0;o[4]=1;o[5]=0;o[6]=s;o[7]=0;o[8]=c;return o;}
+function rotX(a,o=new Array(9)){const c=Math.cos(a),s=Math.sin(a);o[0]=1;o[1]=0;o[2]=0;o[3]=0;o[4]=c;o[5]=s;o[6]=0;o[7]=-s;o[8]=c;return o;}
+function rotZ(a,o=new Array(9)){const c=Math.cos(a),s=Math.sin(a);o[0]=c;o[1]=s;o[2]=0;o[3]=-s;o[4]=c;o[5]=0;o[6]=0;o[7]=0;o[8]=1;return o;}
+function mul3(A,B,o=new Array(9)){   // o must not be the same array as A or B
+ for(let j=0;j<3;j++)for(let i=0;i<3;i++)o[j*3+i]=A[i]*B[j*3]+A[3+i]*B[j*3+1]+A[6+i]*B[j*3+2];return o;}
+// ---------------- Low-poly car model ----------------
+// Body is lofted from cross-section rings (right half mirrored), with real wheel arches,
+// flat-shaded faces and a small lighting shader of its own.
+const GY=.36,FZ=-1.35,RZ=1.5,AR=.46,TRACK=.80,camPos=[0,0,0];
+const C_PAINT=[.045,.17,.48],C_GLASS=[.03,.05,.07],C_BLACK=[.018,.021,.026],C_DARK=[.035,.042,.052],C_LINER=[.012,.014,.018],C_TRIM=[.03,.032,.036];
+function pushTri(out,a,b,c,col,spec){
+ const ux=b[0]-a[0],uy=b[1]-a[1],uz=b[2]-a[2],vx=c[0]-a[0],vy=c[1]-a[1],vz=c[2]-a[2];
+ let nx=uy*vz-uz*vy,ny=uz*vx-ux*vz,nz=ux*vy-uy*vx;const l=Math.hypot(nx,ny,nz);if(l<1e-9)return;nx/=l;ny/=l;nz/=l;
+ for(const p of [a,b,c])out.push(p[0],p[1],p[2],nx,ny,nz,col[0],col[1],col[2],spec);
+}
+function pushTriDir(out,a,b,c,col,spec,dir){
+ const ux=b[0]-a[0],uy=b[1]-a[1],uz=b[2]-a[2],vx=c[0]-a[0],vy=c[1]-a[1],vz=c[2]-a[2];
+ const d=(uy*vz-uz*vy)*dir[0]+(uz*vx-ux*vz)*dir[1]+(ux*vy-uy*vx)*dir[2];
+ if(d<0)pushTri(out,a,c,b,col,spec);else pushTri(out,a,b,c,col,spec);
+}
+function pushTriOut(out,a,b,c,col,spec,o){
+ pushTriDir(out,a,b,c,col,spec,[(a[0]+b[0]+c[0])/3-o[0],(a[1]+b[1]+c[1])/3-o[1],(a[2]+b[2]+c[2])/3-o[2]]);
+}
+// Body: a smoothly interpolated loft of cross-sections (Catmull-Rom along the car) shaped like an ordinary 4-door saloon:
+// a flat, upright nose (the first ring is full size, so the front cap is a flat vertical fascia), a gently rising hood,
+// a raked windscreen, tall side glass, a flat roof, a sloped rear window and a short boot with a flat tail.
+// Corners are rounded and normals are SMOOTH, so the few polygons shade like a high-poly surface.
+// Underbody, sills and wheel liners stay faceted.
+// z, yb, W, Wb, ybelt, Wg, yg, Wr, yt  (W/Wb/Wg/Wr = half widths, y = height above ground; yg = top of the side glass)
+const BK=[
+[-2.30,.30,.900,.860,.76,.80,.77,.70,.80],[-2.22,.25,.940,.900,.79,.84,.80,.72,.83],[-1.80,.20,.965,.930,.84,.86,.85,.74,.875],
+[-1.20,.18,.975,.940,.89,.87,.90,.76,.93],[-.60,.18,.975,.940,.95,.87,.96,.78,.99],[-.20,.18,.975,.945,.96,.84,1.08,.66,1.16],
+[.25,.18,.975,.945,.97,.83,1.31,.68,1.40],[.70,.18,.980,.945,.98,.82,1.35,.66,1.43],[1.10,.18,.980,.945,.98,.82,1.34,.66,1.42],
+[1.45,.18,.980,.945,.97,.85,1.15,.70,1.21],[1.80,.20,.975,.940,.955,.87,.97,.74,.99],[2.10,.23,.950,.910,.95,.88,.96,.78,.97],
+[2.30,.26,.910,.880,.93,.80,.93,.72,.955]];
+function bAt(z){let i=0;while(i<BK.length-2&&z>BK[i+1][0])i++;
+ const A=BK[i],B=BK[i+1],P=BK[Math.max(0,i-1)],N=BK[Math.min(BK.length-1,i+2)],h=B[0]-A[0],t=Math.max(0,Math.min(1,(z-A[0])/h)),t2=t*t,t3=t2*t;
+ return A.slice(1).map((a,j)=>{const b=B[j+1],m0=(b-P[j+1])/(B[0]-P[0])*h,m1=(N[j+1]-a)/(N[0]-A[0])*h;return (2*t3-3*t2+1)*a+(t3-2*t2+t)*m0+(-2*t3+3*t2)*b+(t3-t2)*m1;});}
+function chaikin(U){const pts=[U[0]],so=[];for(let s=0;s<U.length-1;s++){const a=U[s],b=U[s+1];pts.push([.75*a[0]+.25*b[0],.75*a[1]+.25*b[1]]);so.push(s);pts.push([.25*a[0]+.75*b[0],.25*a[1]+.75*b[1]]);so.push(s);}pts.push(U[U.length-1]);so.push(U.length-2);return {pts,so};}
+function ringPts(z){
+ let [yb,W,Wb,ybe,Wg,yg,Wr,yt]=bAt(z);
+ let f=0;for(const zc of [FZ,RZ]){const u=Math.max(0,1-Math.abs(z-zc)/.7);f=Math.max(f,u*u*(3-2*u));}   // wheel-flare weight: fenders bulge out and up over the wheels
+ ybe+=.05*f;W+=.022*f-.02*(1-f);Wb+=.012*f-.05;Wg=Math.min(Wg,Wb-.03);Wr=Math.min(Wr,Wg-.03);yt=Math.max(yt,ybe+.03);yg=Math.max(yg,ybe+.01);
+ const h=ybe-yb,yg2=Math.max(ybe+.004,Math.min(yg,yt-.04));
+ const P=[[0,yb],[.72*W,yb],[.93*W,yb+.1*h],[.99*W-.02*(1-f),yb+.4*h],[W,yb+.7*h],[Wb,ybe],[Wg,yg2],[Wr,Math.max(yg2+.004,yt-.04)],[Wr*.72,Math.max(yg2+.006,yt-.01)],[0,yt]];
+ for(const zc of [FZ,RZ]){const dz=z-zc;if(Math.abs(dz)<=AR+.002){const c=GY+Math.sqrt(Math.max(0,AR*AR-dz*dz));P[1]=[.66,yb];P[2]=[.66,Math.max(c,yb+.1*h)];P[3]=[.99*W,Math.max(P[3][1],c)];P[4]=[W,Math.max(P[4][1],c+.002)];}}
+ const ch=chaikin(P.slice(3));return {P:P.slice(0,3).concat(ch.pts),K:['f','u','s'].concat(ch.so)};
+}
+function mat(zm,kd){
+ const arch=Math.abs(zm-FZ)<=AR+.01||Math.abs(zm-RZ)<=AR+.01,q=bAt(zm),gh=q[7]-q[3],ws=zm>-.52&&zm<.27,rw=zm>1.15&&zm<1.78,cab=zm>-.5&&zm<1.85&&gh>.1;
+ if(kd==='f')return [C_DARK,0];if(kd==='u')return [arch?C_LINER:C_DARK,0];if(kd==='s')return [arch?C_LINER:C_BLACK,.2];
+ if(kd===2)return cab&&zm>-.38&&zm<1.42?(zm>.29&&zm<.42?[C_TRIM,.3]:[C_GLASS,1]):[C_PAINT,.7];   // side glass with a B-pillar
+ if(kd===3)return cab?[C_TRIM,.3]:[C_PAINT,.7];                                                    // black window surround / A-pillar
+ if(kd>=4)return ws||rw?[C_GLASS,1]:[C_PAINT,.7];                                                   // windscreen + rear window
+ return [C_PAINT,.7];
+}
+function detailBox(out,cx,cy,cz,w,h,d,col,sp,tilt){
+ const ang=Math.atan(tilt||0),ca=Math.cos(ang),sa=Math.sin(ang);
+ const P=(sx,sy,sz)=>{const x=sx*w/2,y=sy*h/2,z=sz*d/2;return [cx+x,cy-GY+y*ca+z*sa,cz-y*sa+z*ca];};
+ const f=(a,b,c,e)=>{pushTri(out,a,b,c,col,sp);pushTri(out,a,c,e,col,sp);};
+ f(P(1,-1,-1),P(1,1,-1),P(1,1,1),P(1,-1,1));
+ f(P(-1,-1,1),P(-1,1,1),P(-1,1,-1),P(-1,-1,-1));
+ f(P(-1,1,1),P(1,1,1),P(1,1,-1),P(-1,1,-1));
+ f(P(-1,-1,-1),P(1,-1,-1),P(1,-1,1),P(-1,-1,1));
+ f(P(1,-1,1),P(1,1,1),P(-1,1,1),P(-1,-1,1));
+ f(P(-1,-1,-1),P(-1,1,-1),P(1,1,-1),P(1,-1,-1));
+}
+function buildBody(){
+ const out=[],zs=new Set();
+ for(let z=-2.3;z<2.301;z+=.1)zs.add(+z.toFixed(3));
+ for(const zc of [FZ,RZ])for(const d of [-.47,-.4,-.3,-.2,-.1,0,.1,.2,.3,.4,.47])zs.add(+(zc+d).toFixed(3));
+ const Z=[...zs].sort((x,y)=>x-y),R=Z.map(ringPts),M=R[0].P.length,V=(r,j)=>[r.P[j][0],r.P[j][1]-GY,r.z];
+ R.forEach((r,i)=>r.z=Z[i]);
+ const nq=Z.length-1,fn=[],sm=[],mt=[];
+ for(let i=0;i<nq;i++){fn.push([]);sm.push([]);mt.push([]);for(let j=0;j<M-1;j++){
+  const a=V(R[i],j),b=V(R[i],j+1),c=V(R[i+1],j+1),dd=V(R[i+1],j),ux=c[0]-a[0],uy=c[1]-a[1],uz=c[2]-a[2],vx=dd[0]-b[0],vy=dd[1]-b[1],vz=dd[2]-b[2];
+  let nx=uy*vz-uz*vy,ny=uz*vx-ux*vz,nz=ux*vy-uy*vx;const l=Math.hypot(nx,ny,nz)||1;fn[i].push([nx/l,ny/l,nz/l]);
+  const kd=R[i].K[j],m=mat((Z[i]+Z[i+1])/2,kd);mt[i].push(m);sm[i].push(typeof kd==='number'&&m[0]!==C_LINER);}}
+ const vn=(i,j,ii,jj)=>{if(!sm[i][j])return fn[i][j];let x=0,y=0,z=0;for(let qi=ii-1;qi<=ii;qi++)for(let qj=jj-1;qj<=jj;qj++){if(qi<0||qj<0||qi>=nq||qj>=M-1||!sm[qi][qj])continue;const n=fn[qi][qj];x+=n[0];y+=n[1];z+=n[2];}const l=Math.hypot(x,y,z)||1;return [x/l,y/l,z/l];};
+ const put=(p,n,sg,col,sp)=>out.push(sg*p[0],p[1],p[2],sg*n[0],n[1],n[2],col[0],col[1],col[2],sp);
+ for(let i=0;i<nq;i++)for(let j=0;j<M-1;j++){
+  const [col,sp]=mt[i][j],pa=V(R[i],j),pb=V(R[i],j+1),pc=V(R[i+1],j+1),pd=V(R[i+1],j),na=vn(i,j,i,j),nb=vn(i,j,i,j+1),nc=vn(i,j,i+1,j+1),nd=vn(i,j,i+1,j);
+  for(const sg of [1,-1])for(const [p,n] of [[pa,na],[pb,nb],[pc,nc],[pa,na],[pc,nc],[pd,nd]])put(p,n,sg,col,sp);}
+ const cap=(r,dir,minY)=>{const loop=[];for(let j=0;j<M;j++)loop.push(V(r,j));for(let j=M-2;j>=1;j--){const v=V(r,j);loop.push([-v[0],v[1],v[2]]);}
+  let cy=0;for(const p of loop)cy+=p[1];const c=[0,cy/loop.length,r.z];
+  for(let i=0;i<loop.length;i++){const a=loop[i],b=loop[(i+1)%loop.length],up=(a[1]+b[1]+c[1])/3+GY>minY;pushTriDir(out,c,a,b,up?C_PAINT:C_DARK,up?.7:.05,[0,0,dir]);}};
+ cap(R[0],-1,0);cap(R[R.length-1],1,0);
+ // --- details ---
+ const CHROME=[.62,.66,.72],PIPE=[.20,.21,.23],TAIL=[.80,.03,.04],LENS=[.74,.80,.86],AMBER=[.62,.30,.03],LAMP=[.62,.66,.70],PLATE=[.92,.92,.88];
+ for(const s of [1,-1]){
+  detailBox(out,s*.62,.665,-2.302,.42,.115,.05,C_BLACK,.15);                // headlamp housing on the flat nose
+  detailBox(out,s*.62,.665,-2.322,.39,.090,.012,LENS,.95);                  // clear headlamp lens
+  detailBox(out,s*.55,.665,-2.330,.16,.050,.010,LAMP,-1);                   // headlamp bulb
+  detailBox(out,s*.78,.665,-2.330,.09,.050,.010,AMBER,-1);                  // indicator
+  detailBox(out,s*.72,.40,-2.302,.20,.10,.04,C_BLACK,.2);                   // fog lamp housing
+  detailBox(out,s*.72,.40,-2.324,.14,.06,.01,LENS,.9);
+  detailBox(out,s*1.03,1.02,-.32,.16,.10,.20,C_PAINT,.7);                   // body-colour door mirror
+  detailBox(out,s*1.03,1.02,-.213,.14,.08,.012,C_GLASS,1);                  // mirror glass
+  for(const zz of [.14,.82])detailBox(out,s*.975,.88,zz,.03,.025,.15,CHROME,.85);   // door handles
+  for(const zz of [-.52,.36,1.00])detailBox(out,s*.968,.66,zz,.02,.40,.014,C_DARK,0);   // door shut lines
+  detailBox(out,s*.66,.80,2.305,.46,.13,.05,TAIL,-2);                       // tail lamps
+ }
+ detailBox(out,0,.64,-2.304,.82,.15,.04,C_BLACK,.3);                          // grille
+ for(const y of [.60,.64,.68])detailBox(out,0,y,-2.326,.78,.012,.012,CHROME,.85);
+ detailBox(out,0,.72,-2.322,.86,.02,.03,CHROME,.9);detailBox(out,0,.56,-2.322,.86,.02,.03,CHROME,.9);
+ for(const s of [1,-1])detailBox(out,s*.43,.64,-2.322,.02,.17,.03,CHROME,.9);
+ detailBox(out,0,.64,-2.334,.09,.06,.012,CHROME,.9);                          // badge
+ detailBox(out,0,.40,-2.302,1.0,.11,.04,C_BLACK,.2);                          // lower air intake
+ detailBox(out,0,.40,-2.325,.46,.11,.02,PLATE,.2);                            // front number plate
+ detailBox(out,0,.325,-2.30,1.2,.04,.03,C_BLACK,.2);                          // bumper lower trim
+ detailBox(out,0,.64,2.312,.50,.12,.03,PLATE,.2);                             // rear number plate
+ detailBox(out,0,.34,2.31,1.4,.12,.03,C_BLACK,.15);                           // rear bumper trim
+ detailBox(out,.55,.28,2.27,.10,.08,.20,PIPE,.8);                             // exhaust tip
+ detailBox(out,0,1.46,1.0,.04,.05,.12,C_BLACK,.3);                            // roof antenna
+ for(const s of [1,-1]){
+  detailBox(out,s*.972,.245,.075,.05,.09,1.86,C_BLACK,.3);                  // side skirt
+  detailBox(out,s*.45,.968,2.20,.04,.05,.07,C_BLACK,.3);                    // spoiler mount
+ }
+ detailBox(out,0,1.0,2.20,1.25,.03,.16,C_PAINT,.7);                           // rear lip spoiler
+ detailBox(out,0,.272,-2.338,1.55,.025,.10,C_BLACK,.25);                      // front splitter
+ detailBox(out,-.55,.28,2.27,.10,.08,.20,PIPE,.8);                            // second exhaust tip
+ return out;
+}
+function buildWheel(){
+ const out=[],N=28,O=[0,0,0],TIRE=[.035,.035,.04],RIM=[.70,.72,.76],SPOKE=[.78,.80,.84],DARK=[.03,.032,.04],DISC=[.20,.20,.22],W=.13;
+ // Low-profile tyre: a lathed rounded cross-section with smooth normals (looks round, costs ~700 triangles).
+ const half=[[0,.360],[.085,.358],[.118,.346],[.131,.325],[.134,.300],[.128,.274],[.116,.262]];
+ const prof=half.slice().reverse().map(p=>[-p[0],p[1]]).concat(half.slice(1));
+ const pn=prof.map((p,i)=>{let nx=0,nr=0;for(const j of [i-1,i]){if(j<0||j>=prof.length-1)continue;const dx=prof[j+1][0]-prof[j][0],dr=prof[j+1][1]-prof[j][1],l=Math.hypot(dx,dr);nx+=-dr/l;nr+=dx/l;}const l=Math.hypot(nx,nr)||1;return [nx/l,nr/l];});
+ const vt=(k,a)=>[[prof[k][0],Math.cos(a)*prof[k][1],Math.sin(a)*prof[k][1]],[pn[k][0],Math.cos(a)*pn[k][1],Math.sin(a)*pn[k][1]]];
+ const put=(v,col,sp)=>out.push(v[0][0],v[0][1],v[0][2],v[1][0],v[1][1],v[1][2],col[0],col[1],col[2],sp);
+ const ang=i=>i/N*Math.PI*2,ring=(x,r0,r1,col,sp,dir)=>{for(let i=0;i<N;i++){const a0=ang(i),a1=ang(i+1),P=(r,a)=>[x,Math.cos(a)*r,Math.sin(a)*r];pushTriDir(out,P(r0,a0),P(r1,a0),P(r1,a1),col,sp,[dir,0,0]);pushTriDir(out,P(r0,a0),P(r1,a1),P(r0,a1),col,sp,[dir,0,0]);}};
+ for(let i=0;i<N;i++)for(let j=0;j<prof.length-1;j++){const A=vt(j,ang(i)),B=vt(j+1,ang(i)),C=vt(j+1,ang(i+1)),D=vt(j,ang(i+1));for(const v of [A,B,C,A,C,D])put(v,TIRE,.06);}
+ for(let i=0;i<N;i++){const a0=ang(i),a1=ang(i+1),am=(a0+a1)/2,P=(x,r,a)=>[x,Math.cos(a)*r,Math.sin(a)*r],dir=[0,-Math.cos(am),-Math.sin(am)];   // dark inner barrel
+  pushTriDir(out,P(-.11,.256,a0),P(.116,.256,a0),P(.116,.256,a1),DARK,.2,dir);pushTriDir(out,P(-.11,.256,a0),P(.116,.256,a1),P(-.11,.256,a1),DARK,.2,dir);}
+ ring(.118,.232,.262,RIM,.95,1);       // polished rim lip
+ ring(.03,.06,.236,DARK,.1,1);         // dish background so the spokes read
+ ring(.05,.105,.205,DISC,.55,1);       // brake rotor
+ const spoke=(an,r0,r1,w0,w1,xt,xb)=>{const d=[Math.cos(an),Math.sin(an)],n=[-d[1],d[0]],P=(r,o,x)=>[x,d[0]*r+n[0]*o,d[1]*r+n[1]*o],c=[(xt+xb)/2,d[0]*(r0+r1)/2,d[1]*(r0+r1)/2];
+  const T=[P(r0,-w0,xt),P(r0,w0,xt),P(r1,w1,xt),P(r1,-w1,xt)],B=[P(r0,-w0,xb),P(r0,w0,xb),P(r1,w1,xb),P(r1,-w1,xb)];
+  const q=(a,b,c2,e)=>{pushTriOut(out,a,b,c2,SPOKE,.9,c);pushTriOut(out,a,c2,e,SPOKE,.9,c);};q(T[0],T[1],T[2],T[3]);q(T[1],B[1],B[2],T[2]);q(T[0],T[3],B[3],B[0]);q(T[3],T[2],B[2],B[3]);};
+ for(let k=0;k<5;k++){const an=k/5*Math.PI*2;spoke(an,.05,.24,.044,.030,.112,.06);spoke(an+.20,.12,.245,.012,.020,.108,.07);spoke(an-.20,.12,.245,.012,.020,.108,.07);}   // five main spokes with fine twin-fingers
+ ring(.125,0,.058,RIM,.95,1);ring(.127,0,.024,DARK,.3,1);                    // hub + centre cap
+ return out;
+}
+// ---- Cabin: dashboard, seats, console and a separate steering wheel (turns with the road wheels). Windows are split off so they can be drawn see-through. ----
+function obox(out,cx,cy,cz,w,h,d,rz,col,sp){   // box rotated about Z (local steering-wheel space, no ground offset)
+ const c=Math.cos(rz),s=Math.sin(rz);
+ const P=(sx,sy,sz)=>{const x=sx*w/2,y=sy*h/2;return [cx+x*c-y*s,cy+x*s+y*c,cz+sz*d/2];};
+ const f=(a,b,c2,e)=>{pushTri(out,a,b,c2,col,sp);pushTri(out,a,c2,e,col,sp);};
+ f(P(1,-1,-1),P(1,1,-1),P(1,1,1),P(1,-1,1));f(P(-1,-1,1),P(-1,1,1),P(-1,1,-1),P(-1,-1,-1));f(P(-1,1,1),P(1,1,1),P(1,1,-1),P(-1,1,-1));
+ f(P(-1,-1,-1),P(1,-1,-1),P(1,-1,1),P(-1,-1,1));f(P(1,-1,1),P(1,1,1),P(-1,1,1),P(-1,-1,1));f(P(-1,-1,-1),P(-1,1,-1),P(1,1,-1),P(1,-1,-1));
+}
+function torus(out,R0,r0,nu,nv,col,sp){
+ const T=(u,v)=>{const cu=Math.cos(u),su=Math.sin(u),cv=Math.cos(v),sv=Math.sin(v);return [(R0+r0*cv)*cu,(R0+r0*cv)*su,r0*sv,cv*cu,cv*su,sv];};
+ for(let i=0;i<nu;i++)for(let j=0;j<nv;j++){
+  const a=T(i/nu*6.2832,j/nv*6.2832),b=T((i+1)/nu*6.2832,j/nv*6.2832),c=T((i+1)/nu*6.2832,(j+1)/nv*6.2832),d=T(i/nu*6.2832,(j+1)/nv*6.2832);
+  for(const q of [a,b,c,a,c,d])out.push(q[0],q[1],q[2],q[3],q[4],q[5],col[0],col[1],col[2],sp);}
+}
+function buildCabin(){
+ const out=[],DASH=[.05,.05,.056],DASH2=[.085,.085,.09],SEAT=[.075,.07,.065],SEATH=[.13,.12,.105],GLOW=[.12,.55,1.0],AMB=[.9,.45,.1],SCR=[.12,.3,.55];
+ const B=(cx,cy,cz,w,h,d,col,sp,tilt)=>detailBox(out,cx,cy,cz,w,h,d,col,sp,tilt);
+ B(0,.84,-.34,1.72,.20,.38,DASH,.25);B(0,.95,-.31,1.70,.025,.30,DASH2,.12);                 // dash body + soft-touch top pad
+ B(-.38,.985,-.24,.46,.08,.20,DASH,.2);B(-.38,.945,-.135,.40,.07,.012,[.02,.03,.04],.9);     // instrument hood + cluster glass
+ B(-.47,.945,-.126,.12,.045,.006,GLOW,-1);B(-.29,.945,-.126,.12,.045,.006,AMB,-1);B(-.38,.945,-.126,.04,.045,.006,[.85,.85,.9],-1);   // lit gauges
+ B(0,1.0,-.25,.28,.13,.02,[.02,.025,.03],.9);B(0,1.0,-.238,.25,.105,.004,SCR,-1);          // centre screen
+ for(const sx of [-1,1])B(sx*.58,.90,-.165,.16,.045,.01,C_BLACK,.2);                        // air vents
+ B(0,.56,.28,.24,.34,.95,DASH,.2);B(0,.74,.52,.24,.06,.40,DASH2,.2);B(0,.80,.0,.05,.14,.05,C_BLACK,.3);B(0,.88,.0,.07,.07,.07,DASH2,.5);   // console, armrest, shifter
+ for(const sx of [-1,1]){
+  B(sx*.38,.36,.52,.40,.20,.40,DASH,.1);B(sx*.38,.50,.52,.50,.14,.52,SEAT,.15);              // pedestal + cushion
+  B(sx*.38,.84,.84,.50,.62,.13,SEAT,.15,-.18);B(sx*.38,.84,.77,.34,.50,.02,SEATH,.2,-.18);    // back + lighter insert
+  B(sx*.38,1.22,.93,.24,.20,.09,SEAT,.15,-.18);                                              // head restraint
+ }
+ B(0,.52,1.33,1.28,.14,.50,SEAT,.15);B(0,.88,1.58,1.28,.55,.12,SEAT,.15,-.2);for(const sx of [-1,1])B(sx*.35,1.22,1.64,.22,.16,.08,SEAT,.15,-.2);   // rear bench
+ B(0,1.26,.10,.26,.07,.04,DASH,.3);B(0,1.33,.12,.03,.08,.03,DASH,.3);                       // rear-view mirror
+ return out;
+}
+function buildSteer(){
+ const out=[],COL=[.03,.03,.035],HUB=[.055,.055,.06];
+ torus(out,.175,.017,28,8,COL,.35);
+ for(const an of [Math.PI,0,-Math.PI/2])obox(out,Math.cos(an)*.088,Math.sin(an)*.088,0,.18,.028,.014,an,COL,.3);
+ obox(out,0,0,.012,.09,.09,.034,0,HUB,.4);obox(out,0,0,.03,.045,.045,.006,0,[.62,.66,.72],.9);
+ return out;
+}
+function splitGlass(a){   // cabin glass = triangles that are glass-coloured, glossy and inside the body width (door-mirror glass stays opaque)
+ const op=[],gls=[];
+ for(let t=0;t+29<a.length;t+=30){let g=true;
+  for(let v=0;v<3&&g;v++){const o=t+v*10;g=a[o+9]===1&&Math.abs(a[o+6]-C_GLASS[0])<.002&&Math.abs(a[o+7]-C_GLASS[1])<.002&&Math.abs(a[o+8]-C_GLASS[2])<.002&&Math.abs(a[o])<.93;}
+  const dst=g?gls:op;for(let k=0;k<30;k++)dst.push(a[t+k]);}
+ return {op,gls};
+}
+const bodyAll=buildBody(),sg=splitGlass(bodyAll),bodyData=sg.op,glassData=sg.gls,cabinData=buildCabin(),steerData=buildSteer(),wheelData=buildWheel();
+// ---------------- three.js scene: car, sky, sun + shadows ----------------
+const SM=LOW?1024:2048;
+// Car meshes come from the procedural builders above (10 floats per vertex: position, normal, colour, spec). spec<0 = lamp.
+function carGeo(arr,pick){
+ const tris=[];for(let t=0;t+29<arr.length;t+=30){let ok=true;for(let v=0;v<3;v++)if(!pick(arr[t+v*10+9])){ok=false;break;}if(ok)tris.push(t);}
+ if(!tris.length)return null;
+ const n=tris.length*3,pos=new Float32Array(n*3),nor=new Float32Array(n*3),col=new Float32Array(n*3);let o=0;
+ for(const t of tris)for(let v=0;v<3;v++){const s=t+v*10;pos[o]=arr[s];pos[o+1]=arr[s+1];pos[o+2]=arr[s+2];nor[o]=arr[s+3];nor[o+1]=arr[s+4];nor[o+2]=arr[s+5];col[o]=arr[s+6];col[o+1]=arr[s+7];col[o+2]=arr[s+8];o+=3;}
+ const g=new THREE.BufferGeometry();g.setAttribute('position',new THREE.BufferAttribute(pos,3));g.setAttribute('normal',new THREE.BufferAttribute(nor,3));g.setAttribute('color',new THREE.BufferAttribute(col,3));g.computeBoundingSphere();return g;
+}
+// Car materials: clear-coated metallic paint, polished metal and tinted glass that reflect the live sky (environment map below); matte rubber/plastic for the rest.
+const DS=THREE.DoubleSide;
+const paintMat=LOW?new THREE.MeshStandardMaterial({vertexColors:true,metalness:.3,roughness:.3,side:DS}):new THREE.MeshPhysicalMaterial({vertexColors:true,metalness:.3,roughness:.32,clearcoat:1,clearcoatRoughness:.05,side:DS});
+const shinyMat=new THREE.MeshStandardMaterial({vertexColors:true,metalness:.85,roughness:.16,side:DS});
+const matteMat=new THREE.MeshStandardMaterial({vertexColors:true,metalness:.1,roughness:.72,side:DS});
+const glassMat=new THREE.MeshStandardMaterial({vertexColors:true,metalness:0,roughness:.03,transparent:true,opacity:.5,depthWrite:false,side:DS});
+const paintLite=new THREE.MeshStandardMaterial({vertexColors:true,metalness:.3,roughness:.32,side:DS}),paintMeshes=[];   // cheaper paint without clearcoat, swapped in when the car is far away or the game is struggling
+const envMats=[[paintMat,1],[paintLite,1],[shinyMat,1.25],[matteMat,.35],[glassMat,1.6]];for(const [m,i] of envMats)m.envMapIntensity=i;
+const matLamp=new THREE.MeshBasicMaterial({vertexColors:true}),matBrake=new THREE.MeshBasicMaterial({vertexColors:true});
+matLamp.color.setScalar(1.4);
+const CAR_BUCKETS=[[s=>s>.65&&s<.75,paintMat,true],[s=>s>=.75,shinyMat,true],[s=>s>=-.5&&s<=.65,matteMat,true],[s=>s<-.5&&s>-1.5,matLamp,false],[s=>s<=-1.5,matBrake,false]];
+function carGeos(arr){const out=[];for(const [pick,mat,sh] of CAR_BUCKETS){const g=carGeo(arr,pick);if(g)out.push([g,mat,sh]);}return out;}
+function carGroup(geos){const grp=new THREE.Group();grp.matrixAutoUpdate=false;for(const [g,mat,sh] of geos){const m=new THREE.Mesh(g,mat);m.castShadow=sh;m.receiveShadow=sh;grp.add(m);if(mat===paintMat)paintMeshes.push(m);}return grp;}
+const bodyG=carGroup(carGeos(bodyData)),steerG=carGroup(carGeos(steerData)),wheelGeos=carGeos(wheelData),wheelG=[0,1,2,3].map(()=>carGroup(wheelGeos));
+{const cab=carGroup(carGeos(cabinData));cab.matrixAutoUpdate=true;bodyG.add(cab);
+ const gg=carGeo(glassData,()=>true);if(gg){const gm=new THREE.Mesh(gg,glassMat);gm.renderOrder=2;bodyG.add(gm);}}
+scene.add(bodyG,steerG);for(const w of wheelG)scene.add(w);
+// Headlights: two spot lights parented to the body (local -Z is forward). updateHeadlights() drives their intensity from the time of day;
+// they are never hidden, only dimmed to 0, so the light count stays constant and no shaders recompile when they switch on.
+const HEAD_I=450,headL=[-1,1].map(s=>{const l=new THREE.SpotLight(0xfff1d6,0,120,.52,.55,1.4);l.position.set(s*.62,.3,-2.4);l.target.position.set(s*.7,-.25,-45);bodyG.add(l,l.target);return l;});
+let headOn=0;
+function updateHeadlights(){   // on while driving once the sun is near or below the horizon
+ const tgt=car.occupied?clamp((SKY.night-.1)/.5,0,1):0;headOn+=(tgt-headOn)*.15;
+ const v=headOn<.01?0:headOn;for(const l of headL){l.intensity=v*HEAD_I;l.visible=v>0;}   // fully removed from lighting by day (cheaper shaders); both shader variants are pre-warmed on the first frame
+ matLamp.color.setScalar(1.4+1.6*v);   // lamp lenses glow brighter when lit
+}
+const _m4=new THREE.Matrix4();
+// Scratch matrices: the per-frame render path reuses these instead of allocating new arrays.
+const _R=new Array(9),_RB=new Array(9),_RM=new Array(9),_RW=new Array(9),_RW2=new Array(9),_r1=new Array(9),_r2=new Array(9),_r3=new Array(9),_ra=new Array(9),_rb=new Array(9),_rc=new Array(9);
+function carRot(o,yaw,pitch,roll){mul3(rotY(yaw,_r1),rotX(pitch,_r2),_r3);return mul3(_r3,rotZ(roll,_r1),o);}
+function mulPP(A,M){const o=A===_RW?_RW2:_RW;return mul3(A,M,o);}   // ping-pongs between two scratch matrices so the output never aliases the input
+function setMat(o,P,x,y,z){o.matrix.set(P[0],P[3],P[6],x,P[1],P[4],P[7],y,P[2],P[5],P[8],z,0,0,0,1);o.matrixWorldNeedsUpdate=true;}
+function updateCarVisual(){
+ // Each wheel follows its own suspension target with a damped spring, not a direct snap.
+ for(let i=0;i<WHEELS.length;i++)dampedVisualSpring(suspensionVisual[i],suspension[i].x,suspensionFrameDt,7.5,1.05);
+ const drawY=joltReady&&Number.isFinite(car.renderY)?car.renderY:car.y;
+ const R=carRot(_R,car.yaw,car.pitch,car.roll);
+ mul3(R,rotX(car.visPitch||0,_ra),_rb);
+ const Rb=mul3(_rb,rotZ(car.visRoll||0,_ra),_RB);
+ setMat(bodyG,Rb,car.x,drawY,car.z);
+ // steering wheel: follows the front wheels (about 7:1 ratio), tilted toward the driver
+ const sx=-.38,sy=.97-GY,sz=-.08;
+ mul3(rotX(-.42,_ra),rotZ(car.steer*7,_rb),_rc);
+ const Rm=mul3(Rb,_rc,_RM);
+ setMat(steerG,Rm,car.x+Rb[0]*sx+Rb[3]*sy+Rb[6]*sz,drawY+Rb[1]*sx+Rb[4]*sy+Rb[7]*sz,car.z+Rb[2]*sx+Rb[5]*sy+Rb[8]*sz);
+ for(let wi=0;wi<WHEELS.length;wi++){
+  const w=WHEELS[wi],sv=suspensionVisual[wi].x;
+  let Rw=R;
+  if(w.front)Rw=mulPP(Rw,rotY(car.steer,_ra));
+  if(w.left)Rw=mulPP(Rw,rotY(Math.PI,_ra));
+  const spin=w.front?car.spinF:car.spinR;Rw=mulPP(Rw,rotX(w.left?spin:-spin,_ra));
+  setMat(wheelG[wi],Rw,car.x+R[0]*w.x+R[6]*w.z+R[3]*sv,drawY+R[1]*w.x+R[7]*w.z+R[4]*sv,car.z+R[2]*w.x+R[8]*w.z+R[5]*sv);
+ }
+ matBrake.color.setScalar(car.brakeLit?2.4:.6);
+ updateHeadlights();
+}
+// Sky dome: horizon-to-zenith gradient, sun disc with halo, stars at night. Follows the camera, drawn at the far plane.
+const skyMat=new THREE.ShaderMaterial({
+ uniforms:{uHor:{value:new THREE.Vector3()},uZen:{value:new THREE.Vector3()},uFog:{value:new THREE.Vector3()},uSun:{value:new THREE.Vector3(0,1,0)},uSunCol:{value:new THREE.Vector3(1,1,1)},uNight:{value:0}},
+ vertexShader:'varying vec3 vD;void main(){vD=position;vec4 p=projectionMatrix*modelViewMatrix*vec4(position,1.0);gl_Position=p.xyww;}',
+ fragmentShader:'uniform vec3 uHor,uZen,uFog,uSun,uSunCol;uniform float uNight;varying vec3 vD;\n'+
+  'float h21(vec2 p){return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453);}\n'+
+  'void main(){vec3 d=normalize(vD);float h=d.y;\n'+
+  ' vec3 c=h>0.0?mix(uHor,uZen,pow(h,.45)):mix(uHor,uFog,clamp(-h*6.0,0.0,1.0));\n'+
+  ' float sd=max(dot(d,normalize(uSun)),0.0);c+=uSunCol*(pow(sd,900.0)*8.0+pow(sd,24.0)*.25);\n'+
+  ' if(uNight>.01&&h>0.0){vec3 s=floor(d*230.0);float r=h21(s.xy+s.z*7.3);c+=vec3(step(.9965,r))*uNight*smoothstep(0.0,.25,h);}\n'+
+  ' gl_FragColor=vec4(c,1.0);}',
+ side:THREE.BackSide,depthWrite:false,fog:false});
+const skyMesh=new THREE.Mesh(new THREE.SphereGeometry(900,32,16),skyMat);skyMesh.frustumCulled=false;skyMesh.renderOrder=-10;scene.add(skyMesh);
+// Sun: orthographic shadow box centred on the player/car, snapped to the shadow-texel grid so shadows don't shimmer while moving.
+const SH_E=42,sunL=new THREE.DirectionalLight(0xffffff,1),hemiL=new THREE.HemisphereLight(0xffffff,0x444444,1);
+sunL.castShadow=true;sunL.shadow.mapSize.set(SM,SM);
+{const c=sunL.shadow.camera;c.left=c.bottom=-SH_E;c.right=c.top=SH_E;c.near=1;c.far=420;c.updateProjectionMatrix();}
+sunL.shadow.bias=-.0004;sunL.shadow.normalBias=.05;
+scene.add(sunL,sunL.target,hemiL);
+function updateEnv(cx,cy,cz){
+ const fx=-SUNN[0],fy=-SUNN[1],fz=-SUNN[2];
+ let rx=-fz,rz=fx;const rl=Math.hypot(rx,rz)||1;rx/=rl;rz/=rl;
+ const ux=-rz*fy,uy=rz*fx-rx*fz,uz=rx*fy,ts=2*SH_E/SM;
+ const cr=Math.round((rx*cx+rz*cz)/ts)*ts,cu2=Math.round((ux*cx+uy*cy+uz*cz)/ts)*ts,cf=fx*cx+fy*cy+fz*cz;
+ const px=rx*cr+ux*cu2+fx*cf,py=uy*cu2+fy*cf,pz=rz*cr+uz*cu2+fz*cf;
+ sunL.target.position.set(px,py,pz);sunL.position.set(px+SUNN[0]*200,py+SUNN[1]*200,pz+SUNN[2]*200);sunL.target.updateMatrixWorld();
+ sunL.color.setRGB(SKY.sc[0],SKY.sc[1],SKY.sc[2]);sunL.intensity=Math.PI*.8;
+ const hs=_hs,sc=SKY.sc;for(let i=0;i<3;i++)hs[i]=SKY.hor[i]+(SKY.zen[i]-SKY.hor[i])*.45;
+ hemiL.color.setRGB(hs[0]*.9,hs[1]*.9,hs[2]*.9);hemiL.groundColor.setRGB(.30*(.12+sc[0]*.55),.27*(.12+sc[1]*.55),.20*(.12+sc[2]*.55));hemiL.intensity=Math.PI*.85;
+ scene.fog.color.setRGB(SKY.fog[0],SKY.fog[1],SKY.fog[2]);renderer.setClearColor(scene.fog.color,1);
+ const u=skyMat.uniforms;u.uHor.value.set(SKY.hor[0],SKY.hor[1],SKY.hor[2]);u.uZen.value.set(SKY.zen[0],SKY.zen[1],SKY.zen[2]);u.uFog.value.set(SKY.fog[0],SKY.fog[1],SKY.fog[2]);
+ u.uSun.value.set(SUNN[0],SUNN[1],SUNN[2]);u.uSunCol.value.set(sc[0],sc[1],sc[2]);u.uNight.value=SKY.night;
+ skyMesh.position.copy(camera.position);
+}
+
+// Reflection environment for the car: the live sky dome plus a dark ground, prefiltered once and refreshed as the time of day moves.
+let envRT=null,envTod=-99,envFail=false,envReady=false;
+const envScene=new THREE.Scene(),envSky=new THREE.Mesh(skyMesh.geometry,skyMat),envGround=new THREE.Mesh(new THREE.CircleGeometry(800,24),new THREE.MeshBasicMaterial({color:0x444444}));
+envSky.frustumCulled=false;envScene.add(envSky);envGround.rotation.x=-Math.PI/2;envGround.position.y=-4;envScene.add(envGround);
+let pmrem=null;
+function updateEnvMap(force){
+ if(envFail)return;
+ let d=Math.abs(tod-envTod);d=Math.min(d,24-d);if(!force&&d<.3)return;
+ try{
+  if(!pmrem)pmrem=new THREE.PMREMGenerator(renderer);
+  const k=.12+.88*SKY.sc[1];envGround.material.color.setRGB(.30*k,.31*k,.24*k);
+  const rt=pmrem.fromScene(envScene,0,.1,1000);
+  for(const [m] of envMats){m.envMap=rt.texture;if(!envReady)m.needsUpdate=true;}
+  envReady=true;if(envRT)envRT.dispose();envRT=rt;envTod=tod;
+ }catch(e){envFail=true;console.warn('Car reflections disabled:',e);}
+}
+const WHEELS=[{x:TRACK,z:FZ,front:1,left:0},{x:-TRACK,z:FZ,front:1,left:1},{x:TRACK,z:RZ,front:0,left:0},{x:-TRACK,z:RZ,front:0,left:1}];
+// Independent damped suspension travel for each wheel.
+const suspension=WHEELS.map(()=>({x:0,v:0}));
+// Render-only sprung-mass filters: keep the visible chassis and each wheel moving with
+// damped spring motion when the fixed-step physics solver makes contact corrections.
+const suspensionVisual=WHEELS.map(()=>({x:0,v:0}));
+const rideHeightVisual={x:.12,v:0,ready:false};
+let suspensionFrameDt=1/60;
+function dampedVisualSpring(state,target,dt,frequency=9,damping=1){
+ // Sub-stepped: a single explicit step is only stable when damping*omega*h < 1, which fails at 60 fps or lower (the wheels
+ // diverged and flew off). Steps of <= 1/240 s keep it stable at any frame rate.
+ const dtc=Math.min(Math.max(dt,1/240),1/30),n=Math.ceil(dtc*240),h=dtc/n,omega=frequency*2*Math.PI;
+ for(let i=0;i<n;i++){const a=(target-state.x)*omega*omega-2*damping*omega*state.v;state.v+=a*h;state.x+=state.v*h;}
+ if(!Number.isFinite(state.x)||!Number.isFinite(state.v)){state.x=target;state.v=0;}
+ return state.x;
+}
+// ---- Tyre smoke, dust, kicked-up dirt, crash sparks and skid-mark decals: simulated below (parts / skData), but the three.js scene does not draw them yet ----
+const PMAX=900,parts=[];
+const SKMAX=2600,skData=new Float32Array(SKMAX*6*4);let skN=0,skW=0,skDirty=false;
+const rnd=(a,b)=>a+Math.random()*(b-a);
+function spawnP(x,y,z,vx,vy,vz,life,s0,s1,a,c,gy,drag){if(parts.length<PMAX)parts.push({x,y,z,vx,vy,vz,age:0,life,s0,s1,a,c,gy,drag});}
+function updateParts(dt){
+ for(let i=parts.length-1;i>=0;i--){const p=parts[i];p.age+=dt;
+  if(p.age>=p.life){parts[i]=parts[parts.length-1];parts.pop();continue;}
+  const k=Math.exp(-p.drag*dt);p.vx*=k;p.vz*=k;p.vy=p.vy*(p.gy<0?1:k)+p.gy*dt;p.x+=p.vx*dt;p.y+=p.vy*dt;p.z+=p.vz*dt;
+  if(p.gy<0){const gh=surfaceHeight(p.x,p.z)+.03;if(p.y<gh){if(p.a>1){p.y=gh;p.vy=-p.vy*.35;p.vx*=.6;p.vz*=.6;}else p.age=p.life;}}   // sparks bounce, dirt just lands
+ }
+}
+const fxAcc=[0,0,0,0],fxLast=[null,null,null,null];
+function skidSeg(x0,y0,z0,x1,y1,z1,a){
+ let dx=x1-x0,dz=z1-z0;const l=Math.hypot(dx,dz);if(l<.001)return;dx/=l;dz/=l;const nx=-dz*.11,nz=dx*.11;
+ const q=[[x0+nx,y0,z0+nz],[x0-nx,y0,z0-nz],[x1-nx,y1,z1-nz],[x1+nx,y1,z1+nz]];let o=skW*24;
+ for(const i of [0,1,2,0,2,3]){skData[o++]=q[i][0];skData[o++]=q[i][1];skData[o++]=q[i][2];skData[o++]=a;}
+ skW=(skW+1)%SKMAX;skN=Math.min(skN+1,SKMAX);skDirty=true;
+}
+function updateFx(dt){
+ updateParts(dt);
+ const sp=Math.hypot(car.vl,car.vr);
+ const R=carRot(_R,car.yaw,car.pitch,car.roll);
+ if(R[4]<.35){fxLast.fill(null);return;}   // on its side / roof: no tyre marks
+ const sy=Math.sin(car.yaw),cy=Math.cos(car.yaw),vxw=-sy*car.vl+cy*car.vr,vzw=-cy*car.vl-sy*car.vr;
+ const hb=car.occupied&&keys.has('Space'),gas=car.occupied&&(keys.has('KeyW')||keys.has('ArrowUp'));
+ const lat=Math.max(0,Math.abs(car.vr)-1.8);
+ for(let i=0;i<4;i++){
+  const w=WHEELS[i],wx=car.x+R[0]*w.x+R[6]*w.z,wz=car.z+R[2]*w.x+R[8]*w.z,gy=surfaceHeight(wx,wz);
+  if(car.y-gy>.85){fxLast[i]=null;continue;}   // airborne
+  let sl;
+  if(car.pac&&car.wheelW)sl=Math.abs(car.wheelW[i]*TIRE.R-car.vl);                                // wheel-speed vs ground-speed (Pacejka model)
+  else sl=(w.front?0:(hb?sp*.7:0))+(gas&&!w.front&&sp<6?(6-sp)*.8:0);                             // GTA model: handbrake lock / launch spin
+  const I=Math.min(1,Math.max(Math.max(0,sl-2.4)/6,lat/5*(w.front?.7:1)));
+  if(I>.28){
+   fxAcc[i]+=dt*46*I;
+   while(fxAcc[i]>=1){fxAcc[i]-=1;
+    if(Math.random()<.75)spawnP(wx+rnd(-.12,.12),gy+.12,wz+rnd(-.12,.12),vxw*.3+rnd(-.5,.5),rnd(.2,.9),vzw*.3+rnd(-.5,.5),rnd(1.0,1.9),.28,1.5+I,.10+.2*I,[.88,.88,.9],.55,.8);   // tyre smoke
+    else spawnP(wx+rnd(-.15,.15),gy+.1,wz+rnd(-.15,.15),vxw*.25+rnd(-.8,.8),rnd(.3,1.1),vzw*.25+rnd(-.8,.8),rnd(.8,1.5),.25,1.2,.14,[.55,.48,.36],.4,.9);                // dust
+   }
+   if(I>.5&&Math.random()<dt*14*I)spawnP(wx,gy+.08,wz,-vxw*.35+rnd(-1.2,1.2),rnd(2.2,5),-vzw*.35+rnd(-1.2,1.2),rnd(.6,1.1),.07,.05,.95,[.2,.14,.09],-9.8,.15);   // dirt clods
+  }
+  if(gy>-.6&&sp>8&&Math.random()<dt*(sp-8)*.5)spawnP(wx+rnd(-.2,.2),gy+.1,wz+rnd(-.2,.2),vxw*.1+rnd(-.4,.4),rnd(.2,.6),vzw*.1+rnd(-.4,.4),rnd(.7,1.2),.2,.9,.06,[.55,.5,.4],.3,1.0);   // light road dust at speed
+  if(gy<-.6&&sp>2&&Math.random()<dt*(sp+4)*1.2)spawnP(wx+rnd(-.3,.3),-.55,wz+rnd(-.3,.3),vxw*.2+rnd(-1,1),rnd(.8,2.2),vzw*.2+rnd(-1,1),rnd(.5,.9),.25,.9,.5,[.95,.98,1],-6,.8);   // white water spray
+  if(I>.38){
+   const l=fxLast[i];
+   if(!l||Math.hypot(wx-l[0],wz-l[2])>3)fxLast[i]=[wx,gy+.05,wz];
+   else if(Math.hypot(wx-l[0],wz-l[2])>.07){skidSeg(l[0],l[1],l[2],wx,gy+.05,wz,.2+.5*I);fxLast[i]=[wx,gy+.05,wz];}
+  }else fxLast[i]=null;
+ }
+}
+function crashFx(x,y,z,dV){
+ if(!(dV>2.5))return;
+ const n=Math.min(70,Math.round(10+dV*3.5));
+ for(let k=0;k<n;k++){const a=rnd(0,6.283),sp=rnd(2,9);spawnP(x+rnd(-.5,.5),y+rnd(0,.4),z+rnd(-.5,.5),Math.cos(a)*sp,rnd(1,6),Math.sin(a)*sp,rnd(.25,.75),.05,.03,1.9,[5,2.6,.8],-9.8,.4);}   // sparks (HDR, so they bloom)
+ for(let k=0;k<7;k++)spawnP(x+rnd(-.6,.6),y+rnd(0,.5),z+rnd(-.6,.6),rnd(-1.5,1.5),rnd(.3,1.4),rnd(-1.5,1.5),rnd(.9,1.6),.5,2.2,.22,[.5,.5,.52],.5,.8);   // impact dust
+ shakeAmt=Math.max(shakeAmt,Math.min(1,Math.max(.15,dV/14)));
+}
+// The view matrix is written into one reused Float32Array (column-major). r* = camera right, u* = up, b* = back; x,y,z = eye position.
+const _vm=new Float32Array(16);
+function setView(rx,ry,rz,ux,uy,uz,bx,by,bz,x,y,z){
+ _vm[0]=rx;_vm[1]=ux;_vm[2]=bx;_vm[3]=0;_vm[4]=ry;_vm[5]=uy;_vm[6]=by;_vm[7]=0;_vm[8]=rz;_vm[9]=uz;_vm[10]=bz;_vm[11]=0;
+ _vm[12]=-(rx*x+ry*y+rz*z);_vm[13]=-(ux*x+uy*y+uz*z);_vm[14]=-(bx*x+by*y+bz*z);_vm[15]=1;
+ camPos[0]=x;camPos[1]=y;camPos[2]=z;return _vm;
+}
+function cockpitView(sk){   // eye at the driver's head, following the body's pitch/roll; mouse looks around and re-centres
+ const drawY=joltReady&&Number.isFinite(car.renderY)?car.renderY:car.y;
+ carRot(_R,car.yaw,car.pitch,car.roll);
+ mul3(_R,rotX(car.visPitch||0,_ra),_rb);
+ const R=mul3(_rb,rotZ(car.visRoll||0,_ra),_RB);
+ mul3(rotY(headYaw,_ra),rotX(headPitch,_rb),_rc);
+ const Rh=mul3(R,_rc,_RM),ex=-.38,ey=.84,ez=.58;
+ const x=car.x+R[0]*ex+R[3]*ey+R[6]*ez+sk[0],y=drawY+R[1]*ex+R[4]*ey+R[7]*ez+sk[1],z=car.z+R[2]*ex+R[5]*ey+R[8]*ez+sk[2];
+ return setView(Rh[0],Rh[1],Rh[2],Rh[3],Rh[4],Rh[5],Rh[6],Rh[7],Rh[8],x,y,z);
+}
+// Chase-camera collision: how far along the unit direction (dx,dy,dz) from the target the camera can sit before it would end up
+// inside a building (slab test against each box grown by a small margin) or under the ground.
+function camClear(tx,ty,tz,dx,dy,dz,maxD){
+ const M=.45;let best=maxD;
+ for(const o of solids){
+  const hx=o.w*.5+M,hy=o.h*.5+M,hz=o.d*.5+M,cx=o.x-tx,cz=o.z-tz,rr=Math.hypot(hx,hz)+best;
+  if(cx*cx+cz*cz>rr*rr)continue;
+  let t0=0,t1=best,ok=true;
+  for(let a=0;a<3&&ok;a++){
+   const d=a===0?dx:a===1?dy:dz,p=a===0?tx-o.x:a===1?ty-o.y:tz-o.z,h=a===0?hx:a===1?hy:hz;
+   if(Math.abs(d)<1e-6){if(Math.abs(p)>h)ok=false;}
+   else{let ta=(-h-p)/d,tb=(h-p)/d;if(ta>tb){const s=ta;ta=tb;tb=s;}if(ta>t0)t0=ta;if(tb<t1)t1=tb;if(t0>t1)ok=false;}
+  }
+  if(ok&&t0<best)best=t0;
+ }
+ for(let s=1;s<=14;s++){const d=best*s/14;if(ty+dy*d<surfaceHeight(tx+dx*d,tz+dz*d)+.4){best=best*(s-1)/14;break;}}
+ return best;
+}
+const CAM_DIST=7.5;let chaseDist=CAM_DIST;
+function viewMatrix(){
+ let x=player.x,y=player.y-landDip,z=player.z;const sk=shakeOff();
+ if(car.occupied&&cockpit)return cockpitView(sk);
+ if(car.occupied){
+  // Orbit yaw is unrestricted; pitch is clamped to avoid crossing the poles.
+  const cp=Math.cos(driveOrbitPitch),dirX=Math.sin(driveOrbitYaw)*cp,dirY=Math.sin(-driveOrbitPitch),dirZ=Math.cos(driveOrbitYaw)*cp;
+  const tx=car.x,ty=car.y+.55,tz=car.z;
+  const clear=camClear(tx,ty,tz,dirX,dirY,dirZ,CAM_DIST);
+  chaseDist=clear<chaseDist?clear:chaseDist+(clear-chaseDist)*.05;   // pull in instantly when blocked, ease back out afterwards
+  const dist=Math.max(1.5,chaseDist);
+  x=tx+dirX*dist;y=ty+dirY*dist;z=tz+dirZ*dist;
+  y=Math.max(y,surfaceHeight(x,z)+.35);
+  x+=sk[0];y+=sk[1];z+=sk[2];
+  const dx=tx-x,dy=ty-y,dz=tz-z,len=Math.hypot(dx,dy,dz)||1,fx=dx/len,fy=dy/len,fz=dz/len;
+  let rx=-fz,ry=0,rz=fx;const rl=Math.hypot(rx,ry,rz)||1;rx/=rl;ry/=rl;rz/=rl;
+  const ux=ry*fz-rz*fy,uy=rz*fx-rx*fz,uz=rx*fy-ry*fx;
+  return setView(rx,ry,rz,ux,uy,uz,-fx,-fy,-fz,x,y,z);
+ }
+ x+=sk[0];y+=sk[1];z+=sk[2];
+ const cp=Math.cos(pitch),sp=Math.sin(pitch);
+ const fx=-Math.sin(yaw)*cp,fy=sp,fz=-Math.cos(yaw)*cp;
+ let rx=-fz,ry=0,rz=fx;const rlen=Math.hypot(rx,ry,rz)||1;rx/=rlen;ry/=rlen;rz/=rlen;
+ const ux=ry*fz-rz*fy,uy=rz*fx-rx*fz,uz=rx*fy-ry*fx;
+ return setView(rx,ry,rz,ux,uy,uz,-fx,-fy,-fz,x,y,z);
+}
+let RSC=1,ftAvg=1/60,rsT=0,rsHold=3;   // adaptive render scale (1 = full quality)
+function adaptRes(rdt){if(LOW)return;ftAvg+=(rdt-ftAvg)*.05;rsT+=rdt;if(rsT<1.5)return;rsT=0;if(rsHold>0)rsHold-=1.5;
+ if(ftAvg>.022&&RSC>.7){RSC=Math.max(.7,Math.round((RSC-.05)*100)/100);rsHold=9;}   // struggling: drop resolution a notch
+ else if(ftAvg<.0185&&RSC<1&&rsHold<=0)RSC=Math.min(1,Math.round((RSC+.05)*100)/100);}   // comfortable: win it back
+function resize(){const dpr=LOW?.7:Math.min(window.devicePixelRatio||1,1.5)*RSC,w=Math.max(1,Math.floor(innerWidth*dpr)),h=Math.max(1,Math.floor(innerHeight*dpr));if(canvas.width!==w||canvas.height!==h){renderer.setPixelRatio(1);renderer.setSize(w,h,false);}}
+let paintHi=!LOW;
+function updatePaintLOD(){if(LOW)return;const dx=camera.position.x-car.x,dy=camera.position.y-car.y,dz=camera.position.z-car.z,d=Math.sqrt(dx*dx+dy*dy+dz*dz);
+ const want=paintHi?!(RSC<=.8||d>22):(RSC>=.95&&d<18);   // hysteresis so it doesn't flicker between the two
+ if(want!==paintHi){paintHi=want;const m=want?paintMat:paintLite;for(const o of paintMeshes)o.material=m;}}
+function draw(now){
+ resize();
+ const fovT=74+(car.occupied?clamp((Math.abs(car.vl)-12)/30,0,1)*11:0);fovCur+=(fovT-fovCur)*.08;   // FOV widens with speed
+ const vm=viewMatrix();   // also fills camPos
+ _m4.fromArray(vm).invert().decompose(camera.position,camera.quaternion,camera.scale);
+ camera.fov=fovCur;camera.aspect=canvas.width/canvas.height;camera.updateProjectionMatrix();
+ const fox=car.occupied?car.x:player.x,foy=car.occupied?car.y:player.y-1.7,foz=car.occupied?car.z:player.z;
+ updateWaterMesh();
+ updateCarVisual();
+ updateEnv(fox,foy,foz);
+ updateEnvMap(false);
+ updatePaintLOD();
+ if(!draw.w){draw.w=1;try{const sv=headL.map(l=>l.visible);for(const l of headL)l.visible=!sv[0];renderer.compileAsync(scene,camera).catch(()=>{});headL.forEach((l,i)=>{l.visible=sv[i];});}catch(_){}}   // start compiling the other headlight shader variant now so switching on at dusk doesn't hitch
+ renderer.render(scene,camera);
+}
+function collides(x,z,r=player.r){if(Math.abs(x)+r>WORLD||Math.abs(z)+r>WORLD)return true;for(const o of solids){if(x+r>o.x-o.w/2&&x-r<o.x+o.w/2&&z+r>o.z-o.d/2&&z-r<o.z+o.d/2)return true;}return false;}
+function move(dx,dz){const nx=player.x+dx;if(!collides(nx,player.z))player.x=nx;const nz=player.z+dz;if(!collides(player.x,nz))player.z=nz;}
+// ---------------- Car physics ----------------
+// All car dynamics run in Jolt (below); there is no second physics model.
+const clamp=(v,lo,hi)=>Math.max(lo,Math.min(hi,v));
+function stepCar(dt){if(joltReady)stepJoltCar(dt);}   // the car stays parked until Jolt has finished loading
+// ---------------- Jolt rigid-body vehicle physics ----------------
+// Jolt owns the chassis, terrain, obstacle contacts, gravity and the four VehicleConstraint wheels.
+// The wrappers below (joltWorld / joltCarBody / joltVehicle) expose the small API the game code uses:
+// body state, impulses and per-wheel inputs. The tyre model, crash response and HUD code talk only to them.
+let Jolt=null, joltWorld=null, joltCarBody=null, joltVehicle=null, joltReady=false;
+let physAccumulator=0, joltInitError='', physPrev=null, physCur=null;   // physPrev/physCur: last two physics states, for render interpolation
+const PHYS_STEP=1/120;
+const JOLT_URL='https://cdn.jsdelivr.net/npm/jolt-physics@1.1.1/dist/jolt-physics.wasm-compat.js';
+const JOLT_STEER_SIGN=-1;   // Jolt steers the opposite way to the game's convention (+steer = left)
+function buildJoltWorld(J){
+ const L_STATIC=0,L_MOVING=1;
+ const olf=new J.ObjectLayerPairFilterTable(2);olf.EnableCollision(L_STATIC,L_MOVING);olf.EnableCollision(L_MOVING,L_MOVING);
+ const bpi=new J.BroadPhaseLayerInterfaceTable(2,2);bpi.MapObjectToBroadPhaseLayer(L_STATIC,new J.BroadPhaseLayer(0));bpi.MapObjectToBroadPhaseLayer(L_MOVING,new J.BroadPhaseLayer(1));
+ const st=new J.JoltSettings();st.mObjectLayerPairFilter=olf;st.mBroadPhaseLayerInterface=bpi;st.mObjectVsBroadPhaseLayerFilter=new J.ObjectVsBroadPhaseLayerFilterTable(bpi,2,olf,2);
+ const ji=new J.JoltInterface(st);J.destroy(st);
+ const sys=ji.GetPhysicsSystem(),bi=sys.GetBodyInterface();
+ const tv=new J.Vec3(),tr=new J.RVec3(),tq=new J.Quat();   // reusable temporaries (no per-call allocation)
+ const V=(x,y,z)=>{tv.Set(x,y,z);return tv;},P=(x,y,z)=>{tr.Set(x,y,z);return tr;};
+ sys.SetGravity(V(0,-G,0));
+ const world={timestep:PHYS_STEP,step(){ji.Step(world.timestep,1);}};
+ Object.defineProperty(world,'gravity',{set(g){sys.SetGravity(V(g.x,g.y,g.z));}});
+ const yawQ=y=>new J.Quat(0,Math.sin(y/2),0,Math.cos(y/2));
+ // Box shapes are cached by size, so equal-sized colliders (such as the boundary walls) share one shape and the temporary Vec3 is freed.
+ const boxShapes=new Map();
+ const boxShape=(w,h,d)=>{const key=w+','+h+','+d;let s=boxShapes.get(key);if(!s){const v=new J.Vec3(w/2,h/2,d/2);s=new J.BoxShapeSettings(v,Math.min(.05,w/2,h/2,d/2)).Create().Get();J.destroy(v);boxShapes.set(key,s);}return s;};
+ const addStaticShape=(sh,x,y,z,yaw,fr,re)=>{
+  const pos=new J.RVec3(x,y,z),q=yawQ(yaw||0);
+  const bcs=new J.BodyCreationSettings(sh,pos,q,J.EMotionType_Static,L_STATIC);bcs.mFriction=fr;bcs.mRestitution=re;
+  bi.AddBody(bi.CreateBody(bcs).GetID(),J.EActivation_DontActivate);J.destroy(bcs);J.destroy(pos);J.destroy(q);
+ };
+ const addStatic=(settings,...a)=>addStaticShape(settings.Create().Get(),...a);
+ // Terrain collider uses the same 5 m grid, height function and triangle split as the rendered terrain, so the wheels touch exactly what is drawn.
+ {const step=TSTEP,N=Math.round((WORLD*2)/step)+1,startAt=-WORLD,tl=new J.TriangleList();tl.resize((N-1)*(N-1)*2);let k=0;
+  const H=new Float32Array(N*N*3);let vi=0;
+  for(let iz=0;iz<N;iz++)for(let ix=0;ix<N;ix++){const x=startAt+ix*step,z=startAt+iz*step;H[vi++]=x;H[vi++]=groundHeight(x,z);H[vi++]=z;}
+  const put=(t,a,b,c)=>{for(const [j,idx] of [[0,a],[1,b],[2,c]]){const v=t.get_mV(j);v.x=H[idx*3];v.y=H[idx*3+1];v.z=H[idx*3+2];}};
+  for(let iz=0;iz<N-1;iz++)for(let ix=0;ix<N-1;ix++){const a=iz*N+ix,b=a+1,c=a+N+1,d=a+N;put(tl.at(k++),a,c,b);put(tl.at(k++),a,d,c);}
+  addStatic(new J.MeshShapeSettings(tl),0,0,0,0,1.05,.005);J.destroy(tl);}
+ // Each rendered obstacle receives a matching static cuboid collider at the same transform.
+ for(const o of solids)addStaticShape(boxShape(o.w,o.h,o.d),o.x,o.y,o.z,o.yaw||0,.8,.01);
+ // Fixed boundary colliders.
+ for(const o of [{x:WORLD+1,y:3,z:0,hx:1,hy:8,hz:WORLD+5},{x:-WORLD-1,y:3,z:0,hx:1,hy:8,hz:WORLD+5},{x:0,y:3,z:WORLD+1,hx:WORLD+5,hy:8,hz:1},{x:0,y:3,z:-WORLD-1,hx:WORLD+5,hy:8,hz:1}])
+  addStaticShape(boxShape(o.hx*2,o.hy*2,o.hz*2),o.x,o.y,o.z,0,.8,.01);
+
+ // Chassis: two boxes + a cabin box, ~2200 kg total (density-based).
+ const dens=222*HM.fMass/1500,comp=new J.StaticCompoundShapeSettings(),ident=new J.Quat(0,0,0,1);
+ for(const [hx,hy,hz,px,py,pz,d] of [[.96,.31,1.75,0,.03,0,dens],[.96,.145,2.3,0,.195,0,dens],[.7,.19,.8,0,.53,.4,1]]){
+  const bs=new J.BoxShapeSettings(new J.Vec3(hx,hy,hz),.02);bs.mDensity=d;comp.AddShape(new J.Vec3(px,py,pz),ident,bs,0);}
+ const spawnY=groundHeight(car.x,car.z)+.78,pos0=new J.RVec3(car.x,spawnY,car.z),q0=yawQ(car.yaw);
+ const bcs=new J.BodyCreationSettings(comp.Create().Get(),pos0,q0,J.EMotionType_Dynamic,L_MOVING);
+ bcs.mMotionQuality=J.EMotionQuality_LinearCast;bcs.mAllowSleeping=false;bcs.mLinearDamping=.015;bcs.mAngularDamping=.025;bcs.mFriction=.6;bcs.mRestitution=.005;
+ const body=bi.CreateBody(bcs);bi.AddBody(body.GetID(),J.EActivation_Activate);J.destroy(bcs);
+ const id=body.GetID();
+ bi.SetLinearVelocity(id,V(-Math.sin(car.yaw)*car.vl+Math.cos(car.yaw)*car.vr,0,-Math.cos(car.yaw)*car.vl-Math.sin(car.yaw)*car.vr));
+ bi.SetAngularVelocity(id,V(0,-car.w,0));
+ const M=1/body.GetMotionProperties().GetInverseMass();
+ const v3=v=>({x:v.GetX(),y:v.GetY(),z:v.GetZ()});
+ const bodyApi={
+  mass:()=>M,
+  linvel:()=>v3(body.GetLinearVelocity()),angvel:()=>v3(body.GetAngularVelocity()),translation:()=>v3(body.GetPosition()),
+  rotation:()=>{const q=body.GetRotation();return {x:q.GetX(),y:q.GetY(),z:q.GetZ(),w:q.GetW()};},
+  setLinvel:v=>bi.SetLinearVelocity(id,V(v.x,v.y,v.z)),setAngvel:v=>bi.SetAngularVelocity(id,V(v.x,v.y,v.z)),
+  setTranslation:p=>bi.SetPosition(id,P(p.x,p.y,p.z),J.EActivation_Activate),
+  setRotation:q=>{tq.Set(q.x,q.y,q.z,q.w);bi.SetRotation(id,tq,J.EActivation_Activate);},
+  applyImpulse:i=>bi.AddImpulse(id,V(i.x,i.y,i.z)),
+  applyImpulseAtPoint:(i,p)=>bi.AddImpulse(id,V(i.x,i.y,i.z),P(p.x,p.y,p.z)),
+  applyTorqueImpulse:t=>bi.AddAngularImpulse(id,V(t.x,t.y,t.z))};
+ // ---- Jolt VehicleConstraint: 4 raycast wheels + RWD controller (native engine/gearbox used when the Pacejka tyre model is off) ----
+ const cs=new J.VehicleConstraintSettings();cs.mUp=new J.Vec3(0,1,0);cs.mForward=new J.Vec3(0,0,-1);cs.mMaxPitchRollAngle=Math.PI;
+ const WS=[];
+ for(const wh of WHEELS){
+  const w=new J.WheelSettingsWV();w.mPosition=new J.Vec3(wh.x,-.22,wh.z);w.mSuspensionDirection=new J.Vec3(0,-1,0);w.mSteeringAxis=new J.Vec3(0,1,0);
+  w.mWheelUp=new J.Vec3(0,1,0);w.mWheelForward=new J.Vec3(0,0,-1);
+  w.mSuspensionMinLength=.02;w.mSuspensionMaxLength=.2;   // length from the hard-point to the wheel centre; rests at .2 in the air, ~.11 loaded
+  w.mRadius=.36;w.mWidth=.25;w.mInertia=1.3;w.mMaxSteerAngle=0;w.mMaxBrakeTorque=4000;w.mMaxHandBrakeTorque=0;
+  w.mSuspensionSpring.mMode=J.ESpringMode_StiffnessAndDamping;
+  cs.mWheels.push_back(w);WS.push(w);
+ }
+ const cset=new J.WheeledVehicleControllerSettings(),df=new J.VehicleDifferentialSettings();
+ df.mLeftWheel=2;df.mRightWheel=3;df.mDifferentialRatio=3.4;df.mEngineTorqueRatio=1;cset.mDifferentials.push_back(df);
+ cset.mEngine.mMaxTorque=320;cs.mController=cset;
+ const vc=new J.VehicleConstraint(body,cs);sys.AddConstraint(vc);sys.AddStepListener(new J.VehicleConstraintStepListener(vc));
+ vc.SetVehicleCollisionTester(new J.VehicleCollisionTesterRay(L_MOVING));
+ const cb=new J.VehicleConstraintCallbacksJS();   // the JS binding requires these to be set (kept referenced below)
+ cb.GetCombinedFriction=(wi,dir,fr)=>fr;cb.OnPreStepCallback=()=>{};cb.OnPostCollideCallback=()=>{};cb.OnPostStepCallback=()=>{};cb.SetVehicleConstraint(vc);
+ const ctrl=J.castObject(vc.GetController(),J.WheeledVehicleController);
+ const wheels=[0,1,2,3].map(i=>vc.GetWheel(i));
+ const stiff=[28,28,25,25],cmp=[2.65,2.65,2.45,2.45],rel=[3.65,3.65,3.65,3.65],maxF=[36000,36000,36000,36000];
+ const steer=[0,0,0,0],eng=[0,0,0,0],brk=[0,0,0,0],fric=[-1,-1,-1,-1];
+ const spr=i=>{const s=WS[i].mSuspensionSpring;s.mStiffness=stiff[i]*M;s.mDamping=(cmp[i]+rel[i])/2*M;};
+ for(let i=0;i<4;i++)spr(i);
+ const curve=(c,pts)=>{c.Clear();for(const p of pts)c.AddPoint(p[0],p[1]);};
+ const setFric=(i,v)=>{   // friction scale applied to Jolt's slip curves; ~0 disables tyre friction (Pacejka mode applies its own forces)
+  if(Math.abs(v-fric[i])<=.01*Math.abs(fric[i]))return;fric[i]=v;
+  if(v<.01){curve(WS[i].mLongitudinalFriction,[[0,v],[1,v]]);curve(WS[i].mLateralFriction,[[0,v],[90,v]]);}
+  else{const s=v/2;curve(WS[i].mLongitudinalFriction,[[0,0],[.06,1.2*s],[.2,s]]);curve(WS[i].mLateralFriction,[[0,0],[3,1.2*s],[20,s]]);}
+ };
+ const DRV_REF=6000,BRK_REF=176;
+ const vehicleApi={
+  setWheelSteering:(i,a)=>{steer[i]=a;},setWheelEngineForce:(i,f)=>{eng[i]=f;},setWheelBrake:(i,b)=>{brk[i]=b;},setWheelFrictionSlip:setFric,
+  setWheelSuspensionStiffness:(i,s)=>{stiff[i]=s;spr(i);},setWheelSuspensionCompression:(i,c)=>{cmp[i]=c;spr(i);},setWheelSuspensionRelaxation:(i,r)=>{rel[i]=r;spr(i);},
+  setWheelMaxSuspensionTravel(){},setWheelMaxSuspensionForce(i,f){maxF[i]=f;},   // travel is fixed by min/max length; Jolt has no force cap
+  wheelIsInContact:i=>wheels[i].HasContact(),
+  wheelSuspensionLength:i=>wheels[i].GetSuspensionLength(),
+  wheelSuspensionForce:i=>wheels[i].GetSuspensionLambda()/PHYS_STEP,   // impulse of the last step -> N
+  wheelContactNormal:i=>v3(wheels[i].GetContactNormal()),
+  updateVehicle(){   // push the game's per-wheel inputs into Jolt's controller before the physics step
+   let d=0,b=0;for(let i=0;i<4;i++){d+=eng[i];b+=brk[i];}
+   for(let i=0;i<4;i++)WS[i].mMaxSteerAngle=steer[i]*JOLT_STEER_SIGN;
+   ctrl.SetDriverInput(Math.max(-1,Math.min(1,d/DRV_REF)),1,Math.max(0,Math.min(1,b/BRK_REF)),0);
+  }};
+ return {world,bodyApi,vehicleApi,_cb:cb,_ji:ji,_sys:sys,_vc:vc,_ctrl:ctrl,_wheels:wheels,_WS:WS,_body:body};
+}
+async function initJoltPhysics(){
+ try{
+  const mod=await import(JOLT_URL);
+  Jolt=await (mod.default||mod)();
+  stats.textContent='Building physics world…';play.textContent='Building physics world…';
+  await new Promise(r=>setTimeout(r,50));   // let the page repaint before the long synchronous build below
+  const b=buildJoltWorld(Jolt);
+  joltWorld=b.world;joltCarBody=b.bodyApi;joltVehicle=b.vehicleApi;
+  joltReady=true;
+  applyGravity();   // sets world gravity + gravity-scaled springs
+  stats.textContent='Jolt physics ready · rigid chassis + terrain mesh + 4 suspension wheels';
+  play.disabled=false;play.textContent='Start engine';
+ }catch(err){
+  joltInitError=String(err&&err.message||err);
+  stats.textContent='Jolt failed to load · '+joltInitError;play.textContent='Physics failed to load';
+  error.textContent='Could not load the Jolt physics engine. Check your internet connection, or open this HTML through a local web server. '+joltInitError;
+ }
+}
+// Crash feel. Bigger spin = the car swings around whatever it hits; bigger rebound = it bounces off more.
+// Real-world crash constants (NHTSA / SAE barrier-test data):
+// e0+e1*exp(-v/eS): restitution ~0.4 at a bumper tap, ~0.18 at 18 km/h, ~0.07 at 55 km/h (tests: 0.03-0.2 at speed, up to ~0.33+ when slow)
+// b0: no-damage threshold ~8 km/h; k: residual crush per m/s above it (~0.5 m at 56 km/h); t0+t1*v: pulse length (~105 ms at 56 km/h, ~26 g peak)
+// Rollover: tyres dig in above ~25 km/h sideways slide (soil/rim trip); roof has only ~16 cm of crush space; engines cut oil/fuel feed when inverted.
+const RO={digV:7,digMu:.85,roofRoom:.16,roofK:1.5,stallUp:-.3,stallT:.6};
+const CR={e0:.05,e1:.35,eS:5,b0:2.2,k:.037,t0:.065,t1:.0025,room:{front:.6,rear:.5,side:.25}};   // room = crush space in metres before the cabin is reached
+// ---- Powertrain (rear-wheel drive, 6-speed automatic) ----
+const IDLE=900,REDLINE=6500,BRAKE_TOTAL=120;   // BRAKE_TOTAL ~ 1 g for this mass at 120 Hz
+const PT={gear:1,rpm:IDLE,shift:0,rev:false};
+// ---- GTA V style handling.meta ----
+// Rockstar's engine code is not public. These are the real handling.meta field names and the behaviour the modding
+// community has documented for them (gear speeds spread up to a top speed set by fInitialDriveMaxFlatVel, drive force
+// tapering to zero at each gear's limit, traction that peaks at a slip angle then falls to a minimum, and extra
+// traction loss at low speed under throttle). The numbers below are a typical sports coupe.
+const HM={fMass:2200,fInitialDragCoeff:10,fDriveBiasFront:0,nInitialDriveGears:6,fInitialDriveForce:.17,fInitialDriveMaxFlatVel:250,
+ fClutchChangeRateScaleUpShift:2.5,fClutchChangeRateScaleDownShift:2.5,fBrakeForce:1.0,fBrakeBiasFront:.65,fHandBrakeForce:.75,
+ fSteeringLock:38,fTractionCurveMax:2.4,fTractionCurveMin:2.1,fTractionCurveLateral:22.5,fLowSpeedTractionLossMult:1.0,fTractionBiasFront:.49};
+const V_TOP=HM.fInitialDriveMaxFlatVel*.82/3.6;                                   // m/s, in-game top speed is ~0.82 of the flat velocity
+const GFRAC=[0];for(let g=1;g<=HM.nInitialDriveGears;g++)GFRAC.push(Math.pow(g/HM.nInitialDriveGears,.75));  // each gear's max speed as a share of V_TOP
+const DRAG_COEF=HM.fInitialDragCoeff*HM.fMass*3e-5;                                // N per (m/s)^2
+function gtaTraction(slipDeg,driven,pedal,speed){
+ const lat=HM.fTractionCurveLateral;
+ let g=slipDeg<=lat?HM.fTractionCurveMax:HM.fTractionCurveMax+(HM.fTractionCurveMin-HM.fTractionCurveMax)*clamp((slipDeg-lat)/lat,0,1);
+ if(driven)g*=1-.35*HM.fLowSpeedTractionLossMult*clamp(1-speed/9,0,1)*Math.abs(pedal);   // wheelspin when launching hard
+ return g;
+}
+function torqueAt(r){const x=(r-4300)/3200;return 220*Math.max(.35,1-.55*x*x);}   // Nm, broad peak that falls off at the ends
+// ====== Tyre model: Pacejka "Magic Formula" ======
+// Jolt's wheel friction is only a slip-curve scale. Here Jolt still provides the raycast springs and dampers (so also the load on each
+// tyre), but the tyre forces use the formulas racing sims use: slip ratio + slip angle -> Magic Formula -> friction circle, with load
+// sensitivity, per-wheel rotation (wheelspin / lock-up / ABS), a limited-slip diff and downforce. Press P to switch back to the GTA handling.
+const TIRE={R:.36,Iw:1.3,mu0:1.12,Fz0:HM.fMass*9.81/4,Bx:12,Cx:1.65,Ex:.2,By:11,Cy:1.4,Ey:-.3,loadSens:.1,rollInf:.35,lsd:120};
+function mf(B,C,E,x){const bx=B*x;return Math.sin(C*Math.atan(bx-E*(bx-Math.atan(bx))));}   // F = D sin(C atan(Bx - E(Bx - atan Bx)))
+function tireForce(vx,vy,w,Fz,mu){
+ const R=TIRE.R,peak=mu*Fz,vden=Math.max(Math.abs(vx),3);
+ const kappa=clamp((w*R-vx)/vden,-1.2,1.2),alpha=Math.atan2(vy,vden);          // slip ratio, slip angle
+ const fxp=peak*mf(TIRE.Bx,TIRE.Cx,TIRE.Ex,kappa),fyp=-peak*mf(TIRE.By,TIRE.Cy,TIRE.Ey,alpha);
+ const fxl=-peak*clamp((vx-w*R)/.6,-1,1),fyl=-peak*clamp(vy/.6,-1,1);           // below ~1 m/s slip angle is ill-defined: stick like static friction
+ const bl=clamp((Math.abs(vx)-1)/3,0,1),b=bl*bl*(3-2*bl);
+ let fx=fxl+(fxp-fxl)*b,fy=fyl+(fyp-fyl)*b;
+ const s=Math.hypot(fx,fy)/Math.max(peak,1);if(s>1){fx/=s;fy/=s;}                // friction circle: grip is shared between braking/driving and cornering
+ return {fx,fy};
+}
+function spinWheel(w,T,Tb,h){w+=h*T/TIRE.Iw;const d=Tb*h/TIRE.Iw;return Math.abs(w)<=d?0:w-Math.sign(w)*d;}
+function pacTires(h){
+ const inp=car.tin;if(!inp)return;
+ car.tcsAct=false;
+ const body=joltCarBody,m=body.mass(),q=body.rotation(),t=body.translation(),lv=body.linvel(),av=body.angvel(),W=car.wheelW,R=TIRE.R;
+ const T=inp.T.slice();
+ for(const [a,b] of [[0,1],[2,3]]){if(Math.abs(T[a]+T[b])>1){const l=clamp(TIRE.lsd*(W[b]-W[a]),-400,400);T[a]+=l;T[b]-=l;}}   // limited-slip diff
+ for(let i=0;i<4;i++){
+  let on=false,L=.12,Fz=0,n={x:0,y:1,z:0};
+  try{on=joltVehicle.wheelIsInContact(i);L=joltVehicle.wheelSuspensionLength(i);}catch(_){}
+  if(!on){W[i]=spinWheel(W[i],T[i],inp.B[i],h);continue;}
+  try{const f=joltVehicle.wheelSuspensionForce(i);if(Number.isFinite(f))Fz=f;}catch(_){}
+  try{const nn=joltVehicle.wheelContactNormal(i);if(nn&&Number.isFinite(nn.y)&&nn.y>.3)n=nn;}catch(_){}
+  if(!(Fz>1))Fz=m*G/4;Fz=Math.min(Fz,m*G*1.2);
+  const wh=WHEELS[i],c0=qrot(q,wh.x,-.22,wh.z),dn=qrot(q,0,-(L+R),0);
+  const rel={x:c0.x+dn.x,y:c0.y+dn.y,z:c0.z+dn.z};                              // contact patch relative to the centre of mass
+  const vel={x:lv.x+av.y*rel.z-av.z*rel.y,y:lv.y+av.z*rel.x-av.x*rel.z,z:lv.z+av.x*rel.y-av.y*rel.x};
+  const sd=Math.sin(car.steerW[i]||0),cd=Math.cos(car.steerW[i]||0);
+  let f=qrot(q,-sd,0,-cd);const fn=f.x*n.x+f.y*n.y+f.z*n.z;f={x:f.x-n.x*fn,y:f.y-n.y*fn,z:f.z-n.z*fn};
+  const fl=Math.hypot(f.x,f.y,f.z)||1;f.x/=fl;f.y/=fl;f.z/=fl;
+  const lat={x:f.y*n.z-f.z*n.y,y:f.z*n.x-f.x*n.z,z:f.x*n.y-f.y*n.x};              // wheel's right-hand axis
+  const vx=vel.x*f.x+vel.y*f.y+vel.z*f.z,vy=vel.x*lat.x+vel.y*lat.y+vel.z*lat.z;
+  const mu=TIRE.mu0*clamp(1-TIRE.loadSens*(Fz/TIRE.Fz0-1),.6,1.3)*(1-car.tireDamage*.25)*2*(i<2?HM.fTractionBiasFront:1-HM.fTractionBiasFront);
+  // semi-implicit wheel update: the tyre is extremely stiff, an explicit step would oscillate
+  const f0=tireForce(vx,vy,W[i],Fz,mu).fx,f1=tireForce(vx,vy,W[i]+1,Fz,mu).fx,k=Math.max(0,f1-f0);
+  // Traction control (Forza-style TCS): cut drive torque on a wheel once its slip ratio passes ~12 %, fully by ~22 %
+  let Ti=T[i];
+  if(car.tcs&&Ti!==0){const kap=(W[i]*R-vx)/Math.max(Math.abs(vx),3);if(kap*Ti>0){const c=clamp(1-(Math.abs(kap)-.12)/.1,.05,1);if(c<1)car.tcsAct=true;Ti*=c;}}
+  let w=W[i]+h/TIRE.Iw*(Ti-R*f0)/(1+h*R*k/TIRE.Iw);
+  let Tb=inp.B[i];
+  if(inp.abs){const kap=(W[i]*R-vx)/Math.max(Math.abs(vx),3);Tb*=clamp(1-(-kap-.14)/.08,.15,1);}   // ABS: ease off when the wheel starts to lock
+  const dB=Tb*h/TIRE.Iw;w=Math.abs(w)<=dB?0:w-Math.sign(w)*dB;
+  W[i]=w;
+  const F=tireForce(vx,vy,w,Fz,mu);
+  const px=t.x+rel.x,py=t.y+rel.y,pz=t.z+rel.z,ly=t.y+rel.y*TIRE.rollInf;           // lateral force acts higher up to limit body roll
+  body.applyImpulseAtPoint({x:f.x*F.fx*h,y:f.y*F.fx*h,z:f.z*F.fx*h},{x:px,y:py,z:pz},true);
+  body.applyImpulseAtPoint({x:lat.x*F.fy*h,y:lat.y*F.fy*h,z:lat.z*F.fy*h},{x:px,y:ly,z:pz},true);
+ }
+}
+// Per-physics-step forces Jolt's vehicle constraint doesn't model: aero drag, rolling resistance, anti-roll bars.
+const ARB=[[0,1,17000],[2,3,11000]];   // [right wheel, left wheel, N per m of compression difference]
+function joltForces(h){
+ const v=joltCarBody.linvel(),sp=Math.hypot(v.x,v.y,v.z),spH=Math.hypot(v.x,v.z),m=joltCarBody.mass();
+ const L=[],on=[];let grounded=0;
+ for(let i=0;i<4;i++){let l=.12,c=false;try{l=joltVehicle.wheelSuspensionLength(i);c=joltVehicle.wheelIsInContact(i);}catch(_){}L[i]=l;on[i]=c;if(c)grounded++;}
+ if(sp>.05){
+  const kd=DRAG_COEF*sp*h;                                                   // 0.5*rho*Cd*A*|v|, Cd*A ~ 0.7 m2
+  const kr=grounded&&spH>.3?Math.min(.013*m*G/spH*h,m*.5):0;        // rolling resistance, ~1.3% of weight
+  joltCarBody.applyImpulse({x:-v.x*(kd+kr),y:-v.y*kd,z:-v.z*(kd+kr)},true);
+  if(car.pac&&grounded)joltCarBody.applyImpulse({x:0,y:-.35*spH*spH*h,z:0},true);   // aero downforce: more grip at speed
+ }
+ const q=joltCarBody.rotation(),t=joltCarBody.translation();
+ const rot=(x,y,z)=>{const tx=2*(q.y*z-q.z*y),ty=2*(q.z*x-q.x*z),tz=2*(q.x*y-q.y*x);return {x:x+q.w*tx+(q.y*tz-q.z*ty),y:y+q.w*ty+(q.z*tx-q.x*tz),z:z+q.w*tz+(q.x*ty-q.y*tx)};};
+ if(car.assistF&&grounded>=2){
+  const f=rot(0,0,-1),l=Math.hypot(f.x,f.z)||1,imp=car.assistF*h/l;
+  joltCarBody.applyImpulse({x:f.x*imp,y:0,z:f.z*imp},true);
+ }
+ // Stability control (Forza-style STM): compare the yaw rate the steering asks for (bicycle model, limited by grip) with the real one
+ // and apply a corrective yaw torque when the car rotates too much (oversteer) or too little (understeer). Off during handbrake drifts.
+ car.stmAct=false;
+ if(car.stm&&car.occupied&&grounded>=3&&spH>8&&(car.driftBlend||0)<.15){
+  const w=joltCarBody.angvel(),Lb=Math.abs(FZ-RZ),lim=.95*TIRE.mu0*G/Math.max(spH,1);
+  const des=clamp(car.vl*Math.tan(car.steer)/Lb,-lim,lim),err=w.y-des,dead=.18;
+  if(Math.abs(err)>dead){joltCarBody.applyTorqueImpulse({x:0,y:-(err-Math.sign(err)*dead)*m*3.2*2.2*h,z:0},true);car.stmAct=true;}
+ }
+ for(const [a,b,k] of ARB){
+  if(!on[a]||!on[b])continue;
+  const F=clamp(k*(L[b]-L[a]),-4000,4000);            // right side more compressed -> push it up, left side down
+  const pa=rot(WHEELS[a].x,-.22,WHEELS[a].z),pb=rot(WHEELS[b].x,-.22,WHEELS[b].z);
+  joltCarBody.applyImpulseAtPoint({x:0,y:F*h,z:0},{x:t.x+pa.x,y:t.y+pa.y,z:t.z+pa.z},true);
+  joltCarBody.applyImpulseAtPoint({x:0,y:-F*h,z:0},{x:t.x+pb.x,y:t.y+pb.y,z:t.z+pb.z},true);
+ }
+}
+// Ackermann geometry: the inside front wheel turns more than the outside one so all wheels roll about one centre.
+function ackermann(i){
+ const d=car.steer,a=Math.abs(d);if(a<1e-4)return d;
+ const L=Math.abs(FZ-RZ),T=TRACK*2,R=L/Math.tan(a);
+ const inner=Math.atan(L/(R-T/2)),outer=Math.atan(L/(R+T/2));
+ const isInner=(d>0)?(WHEELS[i].x<0):(WHEELS[i].x>0);   // +steer = left turn, left wheel is x<0
+ return Math.sign(d)*(isInner?inner:outer);
+}
+// ---- Gravity presets (real surface gravities). G drives the physics world, the player and the tyre loads. Spring rates scale with g so ride height stays the same. ----
+const GRAVITIES=[{n:'Earth',g:9.80665},{n:'Mars',g:3.72076},{n:'Moon',g:1.62},{n:'Heavy 1.5 g',g:14.709975}];
+let gravIdx=0;
+function applyGravity(){
+ G=GRAVITIES[gravIdx].g;
+ if(!joltReady)return;
+ joltWorld.gravity={x:0,y:-G,z:0};
+ const k=G/9.80665,sk=Math.sqrt(k);
+ for(let i=0;i<4;i++){const fr=i<2;
+  joltVehicle.setWheelSuspensionStiffness(i,(fr?28:25)*k);
+  joltVehicle.setWheelSuspensionCompression(i,(fr?2.65:2.45)*sk);
+  joltVehicle.setWheelSuspensionRelaxation(i,3.65*sk);
+  joltVehicle.setWheelMaxSuspensionForce(i,36000*Math.max(1,k));
+ }
+}
+// ---- Engine data for the simulation-style drivetrain (about 205 hp turbo coupe, 6-speed) ----
+const ENG={idle:850,red:7000,up:6500,dn:2400,launch:3200,pk:270,pkR:4600,wid:3600,g:[0,3.38,2.15,1.58,1.22,.98,.80],rev:3.2,fin:3.42,eff:.9};
+function engTorque(r){const x=(r-ENG.pkR)/ENG.wid;return ENG.pk*Math.max(.5,1-.5*x*x)*clamp((r-800)/1500,.4,1);}   // Nm
+const LAUNCH={t:0,run:false,t50:0,t100:0};   // 0-50 / 0-100 km/h timer shown in the HUD
+// Smoothed handbrake/drift engagement: rear grip and brake force fade in/out rather than snapping.
+car.driftBlend=car.driftBlend||0;
+car.pac=true;car.tcs=true;car.wheelW=[0,0,0,0];car.steerW=[0,0,0,0];car.tin=null;   // car.pac: Pacejka tyre model on (P toggles); car.tcs: traction control on (T)
+function qrot(q,x,y,z){const tx=2*(q.y*z-q.z*y),ty=2*(q.z*x-q.x*z),tz=2*(q.x*y-q.y*x);return {x:x+q.w*tx+(q.y*tz-q.z*ty),y:y+q.w*ty+(q.z*tx-q.x*tz),z:z+q.w*tz+(q.x*ty-q.y*tx)};}
+function stepJoltCar(dt){
+ let throttle=0,brake=0,steer=0,handbrake=false;
+ const fwd=car.vl;
+ if(car.occupied){
+  const up=keys.has('KeyW')||keys.has('ArrowUp'),dn=keys.has('KeyS')||keys.has('ArrowDown');
+  // W/S are always throttle / reverse: pressing S while rolling forward pushes the car backwards straight away, with no braking phase
+  if(up&&!dn)throttle=1;
+  else if(dn&&!up)throttle=-1;
+  steer=(keys.has('KeyA')||keys.has('ArrowLeft')?1:0)-(keys.has('KeyD')||keys.has('ArrowRight')?1:0);
+  handbrake=keys.has('Space');
+ }else{brake=1;handbrake=true;}
+ // pedal smoothing; braking releases the throttle instantly (drive and brake torque would otherwise fight)
+ car.pedal=car.pedal||0;
+ // While braking against the direction of travel the pedal already ramps towards the new direction (drive stays cut),
+ // so the car switches to reverse/forward the moment it stops instead of waiting for the pedal to build up.
+ const pedalTarget=!car.occupied?0:(brake?(fwd<0?1:-1):throttle);
+ if(!car.occupied)car.pedal=0;else car.pedal+=(pedalTarget-car.pedal)*Math.min(1,dt*(Math.abs(pedalTarget)>Math.abs(car.pedal)?15:22));
+ if(Math.abs(car.pedal)<.03)car.pedal=0;
+ // Pedal pointing against the direction of travel (S while rolling forward, W while rolling back): full drive in the new direction at any speed.
+ const oppose=car.pedal*fwd<0;
+ const vel=joltCarBody.linvel(),speed=Math.hypot(vel.x,vel.z);
+ const driftTarget=(handbrake&&car.occupied&&speed>2)?1:0;
+ car.driftBlend+=(driftTarget-car.driftBlend)*(1-Math.exp(-dt*(driftTarget?4.2:2.1)));
+ const driftBlend=clamp(car.driftBlend,0,1);
+ // GTA-like traction transition: ordinary cornering keeps strong grip, but sustained lateral slip
+ // gently frees the rear axle instead of making the car snap from grip straight into a spin.
+ const slipAngle=Math.atan2(car.vr,Math.max(Math.abs(car.vl),2));
+ const slideTarget=car.occupied&&speed>5?clamp((Math.abs(slipAngle)-.12)/.48,0,1):0;
+ car.slideBlend=car.slideBlend||0;
+ car.slideBlend+=(slideTarget-car.slideBlend)*(1-Math.exp(-dt*(slideTarget>car.slideBlend?2.8:1.45)));
+ const slideBlend=clamp(car.slideBlend,0,1);
+ car.steeringPull*=Math.pow(.5,dt/4);   // alignment pull fades (half-life 4 s) instead of lasting forever
+ const maxSteer=(HM.fSteeringLock*Math.PI/180)/(1+(speed/18)**2),steerAngle=steer*maxSteer*(1-car.steeringDamage*.2)-car.steeringPull;
+ // Slightly slower steering unwind makes counter-steering and catching a slide less twitchy.
+ car.steer+=(steerAngle-car.steer)*Math.min(1,dt*(Math.abs(steerAngle)>Math.abs(car.steer)?13:10));
+ // GTA-style automatic gearbox: gears are speed bands up to V_TOP, shifts cut drive briefly (clutch)
+ if(throttle>0)PT.rev=false;else if(throttle<0||(oppose&&car.pedal<0))PT.rev=true;else if(oppose&&car.pedal>0)PT.rev=false;
+ const av=Math.abs(fwd),NG=HM.nInitialDriveGears;
+ if(PT.rev)PT.gear=1;
+ else if(PT.shift>0)PT.shift-=dt;
+ else if(PT.gear<NG&&av>.96*V_TOP*GFRAC[PT.gear]&&car.pedal>.3){PT.gear++;PT.shift=.5/HM.fClutchChangeRateScaleUpShift;}
+ else if(PT.gear>1&&av<.78*V_TOP*GFRAC[PT.gear-1]){PT.gear--;PT.shift=.25/HM.fClutchChangeRateScaleDownShift;}
+ const vGear=PT.rev?V_TOP*.3:V_TOP*GFRAC[PT.gear];
+ PT.rpm+=(IDLE+(REDLINE-IDLE)*clamp(av/vGear,0,1)-PT.rpm)*Math.min(1,dt*12);
+ // drive force = fInitialDriveForce * mass * g * (V_TOP / gear top speed), fading to 0 at the gear's top speed
+ let drive=0;
+ if(car.pedal!==0&&PT.shift<=0&&(!brake||oppose)){
+  const ratioG=PT.rev?2.2:1/GFRAC[PT.gear],taper=oppose?1:Math.max(0,1-(av/vGear)**2);
+  drive=HM.fInitialDriveForce*HM.fMass*9.81*ratioG*taper*Math.abs(car.pedal)*Math.sign(car.pedal)*(car.stall?0:1-car.engineDamage*.72);
+ }
+ // ---- Simulation-style engine + gearbox (press V): torque curve -> gear ratios -> final drive -> wheels. RPM comes from the driven
+ // wheels, so wheelspin revs the engine; the clutch slips off the line; auto-shifts with torque cut; rev limiter. ----
+ if(car.eng&&joltReady){
+  const E=ENG,Wd=Math.max(Math.abs((car.wheelW[2]+car.wheelW[3])/2),av/TIRE.R);
+  car.egear=car.egear||1;car.es=car.es||0;car.erpm=car.erpm||E.idle;
+  if(PT.rev)car.egear=1;
+  const gr=PT.rev?E.rev:E.g[car.egear];
+  const clutch=clamp(1-av/3,0,1);                                           // clutch slips below ~11 km/h so the engine never stalls
+  const rpmT=Math.max(E.idle,Wd*gr*E.fin*9.5493,(car.pedal!==0?clutch*E.launch:0));
+  car.erpm+=(rpmT-car.erpm)*Math.min(1,dt*18);
+  if(car.es>0)car.es-=dt;
+  else if(!PT.rev){
+   if(car.egear<6&&car.erpm>E.up&&car.pedal>.3){car.egear++;car.es=.22;}
+   else if(car.egear>1&&car.erpm<E.dn&&car.egear>1){car.egear--;car.es=.16;}
+  }
+  PT.gear=car.egear;PT.rpm=car.erpm;
+  let T=0;
+  if(car.pedal!==0&&car.es<=0&&(!brake||oppose)&&(oppose||car.erpm<E.red))T=engTorque(car.erpm)*Math.abs(car.pedal)*Math.sign(car.pedal);
+  drive=T*gr*E.fin*E.eff/TIRE.R*(car.stall?0:1-car.engineDamage*.72);
+ }
+ // Standstill launch: wheel friction is unreliable below ~2 m/s (the slow crawl off the line), so near zero speed the
+ // drive force is applied straight to the chassis and hands over smoothly to the wheels as the car gets moving.
+ if(handbrake&&car.occupied)drive*=1-.18*driftBlend;   // retain throttle during a handbrake turn, with only a small torque cut
+ const assist=car.occupied&&!car.pac?clamp(1-speed/2,0,1):0;
+ car.assistF=drive*assist;car.driveF=drive;drive*=1-assist;
+ // brakes: 65/35 front/rear bias, engine braking on the rear axle, handbrake locks the rears and cuts their grip
+ const fb=brake?BRAKE_TOTAL*HM.fBrakeForce*HM.fMass/1500:0,eb=(car.pedal===0&&PT.shift<=0)?(Math.abs(fwd)>.5?3:25):0;   // engine braking all the way to a stop (stronger hold at crawl speed), otherwise the car creeps at ~2 km/h forever
+ for(let i=0;i<4;i++){
+  joltVehicle.setWheelSteering(i,i<2?ackermann(i):0);car.steerW[i]=i<2?ackermann(i):0;
+  joltVehicle.setWheelEngineForce(i,(i<2?HM.fDriveBiasFront:1-HM.fDriveBiasFront)*drive/2);
+  joltVehicle.setWheelBrake(i,!car.occupied?950:(i<2?fb*HM.fBrakeBiasFront/2:fb*(1-HM.fBrakeBiasFront)/2+eb+(handbrake?driftBlend*110*HM.fHandBrakeForce/.7:0)));
+  const slipDeg=Math.atan2(Math.abs(car.vr),Math.max(Math.abs(car.vl),1))*57.2958,biasT=2*(i<2?HM.fTractionBiasFront:1-HM.fTractionBiasFront);
+  let grip=gtaTraction(slipDeg,(i<2?HM.fDriveBiasFront:1-HM.fDriveBiasFront)>0,car.pedal,speed)*biasT;
+  if(i>=2&&car.occupied){
+   // Rear traction falls progressively with real lateral slip, even without the handbrake.
+   // The handbrake adds a deeper but still blended reduction, so slides are catchable rather than binary.
+   const naturalRearScale=1-.18*slideBlend;
+   const handbrakeRearScale=1-.38*driftBlend;
+   grip*=naturalRearScale*handbrakeRearScale;
+  // Crash-damaged tyres lose grip progressively; this is a handling penalty, not a visual effect.
+  grip*=1-car.tireDamage*.25;
+  }
+  joltVehicle.setWheelFrictionSlip(i,grip);
+ }
+ if(car.pac){
+  const R=TIRE.R,park=!car.occupied,fbT=brake?HM.fBrakeForce*10.8*HM.fMass*R:0,ebT=eb?(eb>3?300:80):0,hbT=handbrake&&car.occupied?driftBlend*3500*HM.fMass/1500:0;   // 16200 N ~ 1.1 g for 1500 kg
+  car.tin={T:[0,1,2,3].map(i=>(i<2?HM.fDriveBiasFront:1-HM.fDriveBiasFront)*drive*R/2),
+   B:[0,1,2,3].map(i=>park?4000*HM.fMass/1500:(i<2?fbT*HM.fBrakeBiasFront/2:fbT*(1-HM.fBrakeBiasFront)/2+ebT+hbT)),abs:!park&&!!brake};
+  for(let i=0;i<4;i++){joltVehicle.setWheelEngineForce(i,0);joltVehicle.setWheelBrake(i,0);joltVehicle.setWheelFrictionSlip(i,1e-4);}
+ }
+ physAccumulator=Math.min(physAccumulator+dt,.25);const pT0=performance.now();let nSteps=0;
+ if(!physCur){physCur={t:joltCarBody.translation(),q:joltCarBody.rotation()};physPrev=physCur;}
+ while(physAccumulator>=PHYS_STEP){
+  joltWorld.timestep=PHYS_STEP;
+  // parking brake: tyre friction alone lets an empty car creep down slopes, so hold it once it is nearly still
+  {const hv=car.occupied?(throttle===0&&!brake?.25:0):.8;if(hv){const pv=joltCarBody.linvel();if(Math.hypot(pv.x,pv.z)<hv)joltCarBody.setLinvel({x:0,y:pv.y,z:0},true);}}   // also settle a coasting car to a true stop instead of a crawl
+  physPrev=physCur;
+  joltForces(PHYS_STEP);
+  if(car.pac)pacTires(PHYS_STEP);
+  joltVehicle.updateVehicle(PHYS_STEP,0);
+  // Detect real collision impulses from the rigid body's velocity change across one fixed physics step.
+  // Normal throttle/braking changes are tiny at 120 Hz; sharp changes indicate an impact.
+  const preImpactV=joltCarBody.linvel();
+  joltWorld.step();
+  const postImpactV=joltCarBody.linvel();
+  const dvx=postImpactV.x-preImpactV.x,dvz=postImpactV.z-preImpactV.z;
+  const impactDelta=Math.hypot(dvx,dvz);
+  // Only treat a hit as a crash (spin, speed loss, damage) when a solid block or the world edge is actually next to the car.
+  // Landing on terrain from a jump is left to the physics engine: the crash response estimates its lever arm from the nearest
+  // block, which would make nose-first landings spin or stop the car oddly.
+  let hitSolid=false;
+  if(impactDelta>1.0){
+   const bp=joltCarBody.translation();
+   if(Math.abs(bp.x)>WORLD-4||Math.abs(bp.z)>WORLD-4)hitSolid=true;
+   else for(const o of solids){
+    if(Number.isFinite(o.y)&&Number.isFinite(o.h)&&(bp.y+.5<o.y-o.h*.5||bp.y-.8>o.y+o.h*.5))continue;
+    const gx=Math.max(0,Math.abs(o.x-bp.x)-o.w*.5),gz=Math.max(0,Math.abs(o.z-bp.z)-o.d*.5);
+    if(Math.hypot(gx,gz)<2.6){hitSolid=true;break;}
+   }
+  }
+  if(impactDelta>1.0&&hitSolid){
+   // Impact geometry: the velocity change points along the contact normal, so compare it with the approach velocity.
+   // closing speed = how fast the car was moving INTO the surface; cosInc = 1 for a head-on hit, ~0 for a glancing scrape.
+   const spPre=Math.max(Math.hypot(preImpactV.x,preImpactV.z),1e-3),nX=dvx/impactDelta,nZ=dvz/impactDelta;
+   const vnClose=Math.max(0,-(preImpactV.x*nX+preImpactV.z*nZ)),cosInc=clamp(vnClose/spPre,0,1);
+   const severity=clamp((vnClose-2.5)/20,0,.34);
+   const fX=-Math.sin(car.yaw),fZ=-Math.cos(car.yaw),rX=Math.cos(car.yaw),rZ=-Math.sin(car.yaw);
+   const deltaLong=dvx*fX+dvz*fZ,deltaSide=dvx*rX+dvz*rZ;
+   const longitudinal=Math.abs(deltaLong),lateral=Math.abs(deltaSide);
+   // Estimate the actual side/corner of contact from the nearest solid obstacle, in the
+   // car's local frame. Using the velocity-change direction alone misses glancing hits
+   // near the middle of a bumper, so derive the lever arm from obstacle position instead.
+   const mass=joltCarBody.mass(),bodyPos=joltCarBody.translation();
+   const bodyYaw=Math.atan2(2*(joltCarBody.rotation().w*joltCarBody.rotation().y),1-2*(joltCarBody.rotation().y*joltCarBody.rotation().y));
+   const bFX=-Math.sin(bodyYaw),bFZ=-Math.cos(bodyYaw),bRX=Math.cos(bodyYaw),bRZ=-Math.sin(bodyYaw);
+   let best=null,bestScore=Infinity;
+   for(const o of solids){
+    if(Number.isFinite(o.y)&&Number.isFinite(o.h)){
+     const obBottom=o.y-o.h*.5,obTop=o.y+o.h*.5;
+     if(bodyPos.y+.15<obBottom||bodyPos.y-.45>obTop)continue;
+    }
+    const ox=o.x-bodyPos.x,oz=o.z-bodyPos.z;
+    const lx=ox*bRX+oz*bRZ,lz=ox*bFX+oz*bFZ;
+    const rad=Math.hypot(o.w||1,o.d||1)*.5;
+    const gapX=Math.max(0,Math.abs(lx)-(.98+rad)),gapZ=Math.max(0,Math.abs(lz)-(2.3+rad));
+    const score=gapX*gapX+gapZ*gapZ;
+    if(score<bestScore){bestScore=score;best={lx,lz};}
+   }
+   // Place the contact on the car perimeter in the direction of the obstacle. This gives
+   // even near-centre bumper hits a proportional lever arm, while corner hits get the most.
+   let localContactX=0,localContactZ=0;
+   if(best){
+    const scale=Math.max(Math.abs(best.lx)/.98,Math.abs(best.lz)/2.3,1e-3);
+    localContactX=clamp(best.lx/scale,-.98,.98);
+    localContactZ=clamp(best.lz/scale,-2.3,2.3);
+   }else{
+    // Fallback for non-obstacle contacts: infer a small off-centre lever arm from the impulse.
+    localContactX=Math.sign(deltaSide)*.38;
+    localContactZ=Math.sign(-deltaLong)*1.1;
+   }
+   const contactX=bRX*localContactX+bFX*localContactZ;
+   const contactZ=bRZ*localContactX+bFZ*localContactZ;
+   // ---- Energy-based crash model ----
+   // 1) Restitution: Jolt's solver is almost perfectly inelastic, so add the rebound real structures give back (falls with speed).
+   const vn=vnClose,e=CR.e0+CR.e1*Math.exp(-vn/CR.eS),postN=postImpactV.x*nX+postImpactV.z*nZ,wantN=e*vn;
+   if(wantN>postN){const J=mass*(wantN-postN);joltCarBody.applyImpulseAtPoint({x:nX*J,y:0,z:nZ*J},{x:bodyPos.x+contactX,y:bodyPos.y,z:bodyPos.z+contactZ},true);}   // at the contact point, so an off-centre hit still swings the car around (r x J)
+   // 2) Energy absorbed by crumpling = 1/2 m v^2 (1-e^2); no permanent damage below ~8 km/h, then crush grows linearly with speed.
+   const zoneK=Math.abs(localContactZ)/2.3>Math.abs(localContactX)/.98?(localContactZ<0?'front':'rear'):'side';
+   const crush=Math.min(Math.max(0,vn-CR.b0)*CR.k,CR.room[zoneK]),d=clamp(crush/CR.room[zoneK],0,1);   // d = share of the crush space used up (the nose has far more than a door)
+   // 3) Crash pulse: dV = v(1+e) delivered as a half-sine over ~65-120 ms -> peak g.
+   const dV=vn*(1+e),T=CR.t0+CR.t1*vn,gPk=Math.PI*dV/(2*T)/9.81;
+   // 4) Damage follows crush depth and where it happened.
+   if(d>0){
+    if(zoneK==='side'){car.steeringDamage=clamp(car.steeringDamage+d*.45,0,.45);car.tireDamage=clamp(car.tireDamage+d*.4,0,.5);car.steeringPull=clamp(car.steeringPull+Math.sign(deltaSide||1)*d*.05,-.05,.05);}
+    else{car.engineDamage=clamp(car.engineDamage+d*(zoneK==='front'?.6:.3),0,.6);car.steeringDamage=clamp(car.steeringDamage+d*.15,0,.45);car.tireDamage=clamp(car.tireDamage+d*.15,0,.5);}
+   }
+   {const av=joltCarBody.angvel(),c=v=>clamp(v,-12,12);joltCarBody.setAngvel({x:c(av.x),y:c(av.y),z:c(av.z)},true);}   // solver safety only
+   car.crashG=gPk;car.crushCm=crush*100;crashFx(bodyPos.x+contactX,bodyPos.y,bodyPos.z+contactZ,dV);
+   {const where=zoneK==='side'?(localContactX>0?'right side':'left side'):zoneK;
+    car.hit={t:4,txt:Math.round(spPre*3.6)+' km/h · '+where+' · '+(cosInc>.8?'head-on':cosInc>.4?'angled':'glancing')+' · dV '+Math.round(dV*3.6)+' km/h · '+gPk.toFixed(0)+' g · crush '+Math.round(crush*100)+' cm · e='+e.toFixed(2)};}
+  }
+  // ---- Rollover physics ----
+  {const rq=joltCarBody.rotation(),upW=qrot(rq,0,1,0),upY=upW.y,fW=qrot(rq,0,0,-1),rW=qrot(rq,1,0,0),av=joltCarBody.angvel(),m=joltCarBody.mass(),bp=joltCarBody.translation();
+   let on=0;for(let i=0;i<4;i++){try{if(joltVehicle.wheelIsInContact(i))on++;}catch(_){}}
+   car.upY=upY;
+   // 1) Tripping: sliding sideways faster than ~25 km/h, the tyres/rims dig in. The sideways force acts at ground height, far below the
+   //    centre of mass, so it makes a roll moment (F x h). Higher centre of mass / faster slide = more likely to tip.
+   const vlat=postImpactV.x*rW.x+postImpactV.z*rW.z,fac=on>0?clamp((Math.abs(vlat)-RO.digV)/6,0,1):0;car.dig=fac;
+   if(fac>0){const J=fac*RO.digMu*m*G*PHYS_STEP*Math.sign(-vlat);joltCarBody.applyImpulseAtPoint({x:rW.x*J,y:0,z:rW.z*J},{x:bp.x-upW.x*.78,y:bp.y-upW.y*.78,z:bp.z-upW.z*.78},true);}
+   // 2) Roll counter: angle turned about the long axis while tipped past ~45 degrees.
+   const rollRate=av.x*fW.x+av.y*fW.y+av.z*fW.z;
+   if(upY<.7)car.rollAcc=(car.rollAcc||0)+Math.abs(rollRate)*PHYS_STEP;
+   else if(upY>.95&&on>=3&&(car.rollAcc||0)>0){if(car.rollAcc>1.4)car.rollInfo={t:6,txt:'ROLLOVER '+(car.rollAcc/6.283).toFixed(1)+' turns'+(car.roofDmg>0?' · roof '+Math.round(car.roofDmg*100)+'% crushed':'')};car.rollAcc=0;}
+   // 3) Inverted engines starve of oil/fuel and cut out; they restart once the car is back on its wheels.
+   if(upY<RO.stallUp){car.invT=(car.invT||0)+PHYS_STEP;if(car.invT>RO.stallT)car.stall=true;}
+   else if(upY>.7){car.invT=0;car.stall=false;}
+   // 4) Body slam onto roof/side panels: bounce uses the same speed-dependent restitution, crush space is far smaller than the nose.
+   const vc=Math.max(0,-preImpactV.y),dvy=postImpactV.y-preImpactV.y;
+   if(upY<.5&&on<2&&dvy>2&&vc>2){
+    const e=CR.e0+CR.e1*Math.exp(-vc/CR.eS),roof=upY<-.3,room=roof?RO.roofRoom:CR.room.side;
+    if(postImpactV.y<e*vc){const v=joltCarBody.linvel();joltCarBody.setLinvel({x:v.x,y:e*vc,z:v.z},true);}
+    const crush=Math.min(Math.max(0,vc-CR.b0)*CR.k*(roof?RO.roofK:1),room),d=crush/room,dV=vc*(1+e),gPk=Math.PI*dV/(2*(CR.t0+CR.t1*vc))/9.81;
+    if(roof)car.roofDmg=clamp((car.roofDmg||0)+d,0,1);else car.steeringDamage=clamp(car.steeringDamage+d*.2,0,.45);
+    car.tireDamage=clamp(car.tireDamage+d*.1,0,.5);crashFx(car.x,car.y+.5,car.z,dV);
+    car.hit={t:4,txt:Math.round(vc*3.6)+' km/h · '+(roof?'roof':'body side')+' slam · dV '+Math.round(dV*3.6)+' km/h · '+gPk.toFixed(0)+' g · crush '+Math.round(crush*100)+' cm'};
+   }
+  }
+  physAccumulator-=PHYS_STEP;
+  physCur={t:joltCarBody.translation(),q:joltCarBody.rotation()};
+  if(++nSteps>=8){physAccumulator=0;break;}
+ }
+ car.physMs=(car.physMs||0)*.9+(performance.now()-pT0)*.1;
+ // Physics runs at a fixed 120 Hz; blend the last two states so rendering is smooth at any refresh rate.
+ const ia=clamp(physAccumulator/PHYS_STEP,0,1),P0=physPrev.t,P1=physCur.t,Q0=physPrev.q,Q1=physCur.q;
+ const t={x:P0.x+(P1.x-P0.x)*ia,y:P0.y+(P1.y-P0.y)*ia,z:P0.z+(P1.z-P0.z)*ia};
+ const qs=(Q0.x*Q1.x+Q0.y*Q1.y+Q0.z*Q1.z+Q0.w*Q1.w)<0?-1:1;
+ const q={x:Q0.x+(qs*Q1.x-Q0.x)*ia,y:Q0.y+(qs*Q1.y-Q0.y)*ia,z:Q0.z+(qs*Q1.z-Q0.z)*ia,w:Q0.w+(qs*Q1.w-Q0.w)*ia};
+ {const ql=Math.hypot(q.x,q.y,q.z,q.w)||1;q.x/=ql;q.y/=ql;q.z/=ql;q.w/=ql;}
+ if(!Number.isFinite(P1.x)||!Number.isFinite(P1.y)||!Number.isFinite(P1.z)||P1.y<-12||Math.abs(P1.x)>WORLD+3||Math.abs(P1.z)>WORLD+3){resetCar(7.8,40,0);return;}
+ const vel2=joltCarBody.linvel();   // read after stepping, so speed/slip reflect this frame
+ const WL=[];for(let i=0;i<4;i++){let l=.12;try{const v=joltVehicle.wheelSuspensionLength(i);if(Number.isFinite(v))l=v;}catch(_){}WL.push(l);}
+ const WLv=WL.map(l=>Math.min(l,.1+.2));   // visual wheel droop limited to ~20 cm below ride height
+ const Lavg=(WLv[0]+WLv[1]+WLv[2]+WLv[3])/4;
+ // Keep the physics-derived pose for gameplay, but smooth the rendered ride-height offset
+ // separately so chassis height doesn't jump when wheel-ray lengths change at a terrain seam.
+ if(!rideHeightVisual.ready){rideHeightVisual.x=Lavg;rideHeightVisual.v=0;rideHeightVisual.ready=true;}
+ const smoothLavg=dampedVisualSpring(rideHeightVisual,Lavg,suspensionFrameDt,3.2,1.0);
+ {const o=qrot(q,0,-(.22+Lavg),0),ov=qrot(q,0,-(.22+smoothLavg),0);car.x=t.x+o.x;car.y=t.y+o.y;car.renderY=t.y+ov.y;car.z=t.z+o.z;}   // visual sprung-mass ride height is smoothed independently of the collision pose
+ // Quaternion to yaw/pitch/roll, in the car model's convention.
+ const siny=2*(q.w*q.y+q.x*q.z),cosy=1-2*(q.y*q.y+q.x*q.x);
+ car.yaw=Math.atan2(siny,cosy);
+ const sinp=2*(q.w*q.x-q.z*q.y);car.pitch=Math.asin(clamp(sinp,-1,1));
+ const sinr=2*(q.w*q.z+q.x*q.y),cosr=1-2*(q.x*q.x+q.z*q.z);car.roll=Math.atan2(sinr,cosr);
+ const forwardX=-Math.sin(car.yaw),forwardZ=-Math.cos(car.yaw);
+ car.vl=vel2.x*forwardX+vel2.z*forwardZ;car.vr=vel2.x*Math.cos(car.yaw)-vel2.z*Math.sin(car.yaw);car.w=joltCarBody.angvel().y;
+ if(car.hit&&car.hit.t>0)car.hit.t-=dt;if(car.rollInfo&&car.rollInfo.t>0)car.rollInfo.t-=dt;
+ {// Weight transfer: longitudinal / lateral acceleration -> body dive, squat and roll (body mesh only), plus per-wheel load for the HUD
+  const aLong=(car.vl-(car.pvl===undefined?car.vl:car.pvl))/Math.max(dt,1e-3);car.pvl=car.vl;
+  car.aLs=(car.aLs||0)+(aLong-(car.aLs||0))*Math.min(1,dt*8);
+  const aRight=-car.vl*car.w;                                          // centripetal acceleration along the car's right axis
+  car.visPitch=(car.visPitch||0)+(clamp(.0075*car.aLs,-.11,.11)-(car.visPitch||0))*Math.min(1,dt*9);   // braking: nose dives, accelerating: tail squats
+  car.visRoll=(car.visRoll||0)+(clamp(.0085*aRight,-.12,.12)-(car.visRoll||0))*Math.min(1,dt*9);        // body leans toward the outside of a turn
+  car.wl=car.wl||[1,1,1,1];
+  for(let i=0;i<4;i++){let f=0;try{f=joltVehicle.wheelSuspensionForce(i);}catch(_){}car.wl[i]+=((Number.isFinite(f)?f:0)-car.wl[i])*Math.min(1,dt*14);}
+ }
+ {const dvy=vel2.y-(car.pvy===undefined?vel2.y:car.pvy);car.pvy=vel2.y;if(dvy>4)shakeAmt=Math.max(shakeAmt,Math.min(.7,dvy*.05));}   // landing thump
+ car.speed=car.vl;car.vy=vel2.y;car.brakeLit=car.occupied&&(brake>0||handbrake||oppose);
+ if(car.pac){car.spinF+=(car.wheelW[0]+car.wheelW[1])/2*dt;car.spinR+=(car.wheelW[2]+car.wheelW[3])/2*dt;}else{car.spinF+=car.vl*dt/.36;car.spinR+=car.vl*dt/.36;}
+ {const kmh=Math.abs(car.vl)*3.6;
+  if(!LAUNCH.run&&car.occupied&&throttle>0&&kmh<2){LAUNCH.run=true;LAUNCH.t=0;LAUNCH.t50=0;LAUNCH.t100=0;}
+  if(LAUNCH.run){LAUNCH.t+=dt;if(!LAUNCH.t50&&kmh>=50)LAUNCH.t50=LAUNCH.t;if(!LAUNCH.t100&&kmh>=100){LAUNCH.t100=LAUNCH.t;LAUNCH.run=false;}if(!car.occupied||throttle<=0||brake>0)LAUNCH.run=false;}}
+ for(let i=0;i<4;i++)suspension[i].x=clamp(Lavg-WLv[i],-.45,.3);   // wheel centre follows the simulated suspension
+}
+function resetCar(x=car.x,z=car.z,yawNew=car.yaw){
+  car.engineDamage=0;car.steeringDamage=0;car.tireDamage=0;car.steeringPull=0;car.spinPend=0;car.roofDmg=0;car.stall=false;car.invT=0;car.rollAcc=0;car.wheelW=[0,0,0,0];
+ const gy=surfaceHeight(x,z);
+ if(joltReady){physPrev=physCur=null;const h=yawNew/2;joltCarBody.setTranslation({x,y:gy+.85,z},true);joltCarBody.setRotation({x:0,y:Math.sin(h),z:0,w:Math.cos(h)},true);joltCarBody.setLinvel({x:0,y:0,z:0},true);joltCarBody.setAngvel({x:0,y:0,z:0},true);}
+ car.x=x;car.z=z;car.yaw=yawNew;car.y=gy+.36;car.renderY=car.y;car.driftBlend=0;car.slideBlend=0;rideHeightVisual.ready=false;for(const sv of suspensionVisual){sv.x=0;sv.v=0;}car.pitch=car.roll=car.pitchV=car.rollV=0;car.vl=car.vr=car.w=car.vy=0;car.steer=0;
+}
+// Player is a circle, the parked car an oriented box: push the player out along the shallowest axis.
+function pushPlayerOutOfCar(){
+ if(car.occupied)return;
+ const fx=-Math.sin(car.yaw),fz=-Math.cos(car.yaw),rx=Math.cos(car.yaw),rz=-Math.sin(car.yaw);
+ const dx=player.x-car.x,dz=player.z-car.z,lf=dx*fx+dz*fz,lr=dx*rx+dz*rz,hl=2.3+player.r,hw=1.05+player.r;
+ if(Math.abs(lf)>=hl||Math.abs(lr)>=hw)return;
+ const penF=hl-Math.abs(lf),penR=hw-Math.abs(lr);
+ if(penR<penF){const sg=lr>=0?1:-1;player.x+=rx*sg*penR;player.z+=rz*sg*penR;}else{const sg=lf>=0?1:-1;player.x+=fx*sg*penF;player.z+=fz*sg*penF;}
+}
+function gearLabel(){return PT.rev?'R':'G'+PT.gear;}
+function isDrifting(){return Math.abs(car.vl)>5&&Math.abs(Math.atan2(car.vr,Math.abs(car.vl)))>.28;}
+function update(dt){
+ if(keys.has('KeyE')&&!update.eWasDown){
+   update.eWasDown=true;
+   if(car.occupied){
+     car.occupied=false;
+     const c=Math.cos(car.yaw),s=Math.sin(car.yaw);
+     let ex=car.x+c*1.8,ez=car.z-s*1.8;
+     if(collides(ex,ez)){ex=car.x-c*1.8;ez=car.z+s*1.8;if(collides(ex,ez)){ex=car.x;ez=car.z;}}
+     player.x=ex;player.z=ez;player.y=surfaceHeight(ex,ez)+1.7;vy=0;pvx=pvz=0;landDip=0;grounded=true;yaw=car.yaw;pitch=0;
+   } else if(Math.hypot(player.x-car.x,player.z-car.z)<3.2&&Math.abs(car.vl)<8){
+     car.occupied=true; driveOrbitYaw=car.yaw; driveOrbitPitch=-0.38;
+   }
+ } else if(!keys.has('KeyE')) update.eWasDown=false;
+
+ if(keys.has('KeyR')&&!update.rWasDown){update.rWasDown=true;if(car.occupied)resetCar();}else if(!keys.has('KeyR'))update.rWasDown=false;
+ if(todAuto)tod=(tod+dt/20*(1+SKY.night*5))%24;   // a day lasts ~5 min; the dark hours are skipped faster
+ setSun();shakeAmt*=Math.exp(-dt*4);
+ if(cockpit&&performance.now()-lastMouseT>900){const k=Math.exp(-dt*1.6);headYaw*=k;headPitch*=k;}
+ stepCar(dt);updateFx(dt);
+ if(car.occupied){
+   player.x=car.x;player.y=car.y+1.05;player.z=car.z;
+ } else {
+   const f=(keys.has('KeyW')||keys.has('ArrowUp')?1:0)-(keys.has('KeyS')||keys.has('ArrowDown')?1:0);
+   const s=(keys.has('KeyD')||keys.has('ArrowRight')?1:0)-(keys.has('KeyA')||keys.has('ArrowLeft')?1:0);
+   const len=Math.hypot(f,s)||1, speed=keys.has('ShiftLeft')||keys.has('ShiftRight')?9:5.3;
+   const wx=(-Math.sin(yaw)*f/len+Math.cos(yaw)*s/len)*speed,wz=(-Math.cos(yaw)*f/len-Math.sin(yaw)*s/len)*speed;
+   const ac=Math.min(1,dt*(grounded?14:1.2));   // full control on the ground, very little in the air
+   pvx+=(wx-pvx)*ac;pvz+=(wz-pvz)*ac;
+   move(pvx*dt,pvz*dt);
+   landDip-=landDip*Math.min(1,dt*7);
+   const gy=surfaceHeight(player.x,player.z)+1.7;
+   if(grounded&&player.y-gy<.35){player.y=gy;vy=0;}
+   else{
+    vy+=(-G+(vy<0?1:-1)*DRAG_K*vy*vy)*dt;player.y+=vy*dt;grounded=false;
+    if(player.y<=gy){const hit=-vy;player.y=gy;vy=0;grounded=true;
+     if(hit>3){landDip=Math.min(.4,hit*.014);if(hit>7){const k=Math.max(.25,1-(hit-7)*.06);pvx*=k;pvz*=k;}}}   // hard landing: camera dip + lost speed
+   }
+   pushPlayerOutOfCar();
+ }
+}
+play.addEventListener('click',()=>canvas.requestPointerLock());
+initJoltPhysics();
+document.addEventListener('pointerlockchange',()=>{locked=document.pointerLockElement===canvas;start.style.display=locked?'none':'grid';});
+document.addEventListener('pointerlockerror',()=>{error.textContent='Mouse capture was blocked. Click Start again, or use a local server.';});
+document.addEventListener('mousemove',e=>{if(!locked)return;if(car.occupied&&cockpit){headYaw=Math.max(-2.2,Math.min(2.2,headYaw-e.movementX*.0025));headPitch=Math.max(-.9,Math.min(.9,headPitch-e.movementY*.0025));lastMouseT=performance.now();}else if(car.occupied){driveOrbitYaw-=e.movementX*.0025;driveOrbitPitch=Math.max(-1.25,Math.min(-0.06,driveOrbitPitch-e.movementY*.0025));}else{yaw-=e.movementX*.0022;pitch=Math.max(-1.48,Math.min(1.48,pitch-e.movementY*.0022));}});
+document.addEventListener('keydown',e=>{keys.add(e.code);if(!e.repeat){if(e.code==='KeyL'){try{localStorage.setItem('gfxQ',LOW?'high':'low');}catch(_){}location.href=location.pathname+'?q='+(LOW?'high':'low');}if(e.code==='KeyG'){gravIdx=(gravIdx+1)%GRAVITIES.length;applyGravity();}if(e.code==='KeyT')car.tcs=!car.tcs;if(e.code==='KeyN')todAuto=!todAuto;if(e.code==='KeyM'){tod=(tod+1.5)%24;setSun();}if(e.code==='KeyC'){cockpit=!cockpit;headYaw=headPitch=0;}if(e.code==='KeyV')car.eng=!car.eng;if(e.code==='KeyY')car.stm=!car.stm;}if(e.code==='KeyP'){car.pac=!car.pac;car.wheelW=[0,0,0,0].map(()=>car.vl/TIRE.R);}if(['Space','ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(e.code))e.preventDefault();if(e.code==='Space'&&grounded&&!car.occupied){vy=3.2;grounded=false;}});
+document.addEventListener('keyup',e=>keys.delete(e.code));window.addEventListener('blur',()=>keys.clear());window.addEventListener('resize',resize);
+let last=performance.now(),frames=0,elapsed=0;
+const TIMESCALE=1.4;   // whole game runs 40% faster (walking, car, gravity); handling values are unchanged
+const loadEl=document.getElementById('load'),loadCells=loadEl.querySelectorAll('b');
+function updateLoadHud(){
+ const show=car.occupied&&joltReady&&car.wl;loadEl.style.display=show?'grid':'none';if(!show)return;
+ const tot=car.wl[0]+car.wl[1]+car.wl[2]+car.wl[3]||1,order=[1,0,3,2];   // top-down: front-left, front-right, rear-left, rear-right
+ for(let k=0;k<4;k++){const pct=car.wl[order[k]]/tot*100;loadCells[k].textContent=Math.round(pct)+'%';loadCells[k].style.background='rgba(40,120,186,'+(.18+clamp((pct-10)/40,0,1)*.82).toFixed(2)+')';}
+}
+function loop(t){const rdt=Math.min((t-last)/1000,.1),dt=rdt*TIMESCALE;last=t;adaptRes(rdt);suspensionFrameDt=Math.max(1/240,dt);try{update(dt);draw(t);updateLoadHud();}catch(err){if(!loop.err){loop.err=1;console.error(err);error.textContent='Runtime error (game keeps running): '+(err&&err.message||err);}}frames++;elapsed+=rdt;if(elapsed>.5){const nearCar=Math.hypot(player.x-car.x,player.z-car.z)<3.2;stats.textContent=Math.round(frames/elapsed)+' FPS · '+(joltReady?'JOLT · ':'PHYSICS LOADING · ')+(car.occupied?'DRIVING · '+Math.round(Math.abs(car.vl)*3.6)+' km/h · '+gearLabel()+(joltReady?' · '+Math.round(PT.rpm/50)*50+' rpm':'')+(isDrifting()?' · DRIFT':'')+(joltReady&&car.occupied?' · drive '+Math.round(car.driveF||0)+' N · phys '+(car.physMs||0).toFixed(1)+' ms':'')+(joltReady&&car.occupied&&(LAUNCH.run||LAUNCH.t50||LAUNCH.t100)?' · 0-50: '+(LAUNCH.t50?LAUNCH.t50.toFixed(1):LAUNCH.t.toFixed(1)+'…')+'s'+(LAUNCH.t100?' · 0-100: '+LAUNCH.t100.toFixed(1)+'s':''):''):nearCar&&Math.abs(car.vl)<8?'Press E to enter car':'On foot')+' · g '+G.toFixed(2)+(gravIdx?' ('+GRAVITIES[gravIdx].n+')':'')+(car.hit&&car.hit.t>0?' · CRASH '+car.hit.txt:'')+((car.rollAcc||0)>1.4?' · ROLLING '+(car.rollAcc/6.283).toFixed(1)+' turns':'')+(car.rollInfo&&car.rollInfo.t>0?' · '+car.rollInfo.txt:'')+(car.stall?' · ENGINE CUT (inverted)':'')+(car.dig>.3?' · TYRES DIGGING IN':'')+(car.eng?' · ENGINE SIM':'')+(car.tcs?' · TCS'+(car.tcsAct?'!':''):'')+(car.stm?' · STM'+(car.stmAct?'!':''):'')+' · '+(cubeInstances.length+5)+' objects';frames=0;elapsed=0;}requestAnimationFrame(loop);}
+requestAnimationFrame(loop);
+})();
+
+</script>
+</body></html>
