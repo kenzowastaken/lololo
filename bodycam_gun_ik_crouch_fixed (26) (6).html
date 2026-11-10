@@ -1,0 +1,2171 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Jolt + Three.js FPS Character Controller</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #8fb4d9; font-family: system-ui, sans-serif; }
+  canvas { display: block; }
+  #hud { position: fixed; left: 12px; top: 12px; color: #fff; font-size: 13px; line-height: 1.5;
+         background: rgba(0,0,0,.45); padding: 8px 12px; border-radius: 8px; pointer-events: none; white-space: pre; }
+  #cross { display: none !important; position: fixed; left: 50%; top: 50%; width: 6px; height: 6px; margin: -3px 0 0 -3px;
+           border-radius: 50%; background: rgba(255,255,255,.85); pointer-events: none; }
+  #bodycam { position: fixed; inset: 0; pointer-events: none; }
+  #bodycam .rec { position: absolute; top: 14px; right: 18px; text-align: right; color: #fff; font: 600 14px/1.5 ui-monospace, monospace; text-shadow: 0 0 4px #000; }
+  #bodycam .rec b { color: #ff3b30; animation: blink 1.6s steps(1) infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+  #overlay { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; flex-direction: column;
+             background: rgba(0,0,0,.55); color: #fff; cursor: pointer; text-align: center; }
+  #overlay h1 { margin: 0 0 8px; font-size: 26px; }
+  #overlay p { margin: 4px 0; opacity: .85; }
+  #bodyEd { position: fixed; right: 0; top: 0; bottom: 0; width: 310px; overflow-y: auto; box-sizing: border-box; padding: 10px 12px 16px;
+            background: rgba(18,22,38,.94); color: #e8ecff; font-size: 12px; z-index: 30; display: none; }
+  #bodyEd .be-head { display: flex; justify-content: space-between; align-items: center; font-size: 15px; margin-bottom: 4px; }
+  #bodyEd .be-hint { opacity: .7; line-height: 1.4; margin-bottom: 8px; }
+  #bodyEd button { background: #3b4a8f; color: #fff; border: 0; border-radius: 6px; padding: 6px 10px; cursor: pointer; font-size: 12px; }
+  #bodyEd button:hover { background: #4d5fc0; }
+  #bodyEd select { width: 100%; padding: 6px; border-radius: 6px; margin: 8px 0; background: #2a3260; color: #fff; border: 1px solid #4a5699; font-size: 13px; }
+  #bodyEd .be-cam, #bodyEd .be-btns { display: flex; gap: 6px; margin: 6px 0; }
+  #bodyEd .be-sec { margin: 12px 0 4px; font-weight: 600; color: #ffe14d; text-transform: uppercase; font-size: 10px; letter-spacing: .08em; }
+  #bodyEd .be-row { display: grid; grid-template-columns: 96px 1fr 58px; gap: 6px; align-items: center; margin: 3px 0; }
+  #bodyEd .be-row input[type=number] { width: 58px; background: #2a3260; color: #fff; border: 1px solid #4a5699; border-radius: 4px; padding: 2px 3px; font-size: 11px; }
+  #bodyEd input[type=range] { width: 100%; }
+  #bodyEd textarea { width: 100%; height: 120px; box-sizing: border-box; background: #10142a; color: #cfe; border: 1px solid #4a5699; border-radius: 6px; font: 10px monospace; }
+  #bodyEd summary { cursor: pointer; margin: 10px 0 4px; opacity: .85; }
+</style>
+</head>
+<body>
+<div id="bodycam"><div class="rec"><b>●</b> REC<br><span id="bcTime"></span></div></div>
+<div id="overlay"><h1>Click to play</h1><p id="status">Loading Jolt Physics (WASM)…</p>
+  <p>WASD move · Shift sprint · C crouch (hold) · Space jump · Mouse look · V cycle first / third (back) / third (front) · B body editor · Esc release · Backspace respawn</p>
+  <p>Bodycam weapon: LMB fire · RMB aim · R reload · X semi/auto</p>
+  <p>Drop an exported Roblox animation .json anywhere on the page to use it</p></div>
+<div id="cross"></div>
+<div id="hud"></div>
+
+<script crossorigin="anonymous" src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+(async function main() {
+  const statusEl = document.getElementById('status');
+  const overlay = document.getElementById('overlay');
+  const hud = document.getElementById('hud');
+
+  // ---------------------------------------------------------------- 1. WASM INIT
+  function fail(msg) { statusEl.textContent = 'Error: ' + msg; statusEl.style.color = '#ffb4b4'; console.error(msg); }
+  window.addEventListener('error', e => { if (e.message && e.message !== 'Script error.') fail(e.message); });
+  window.addEventListener('unhandledrejection', e => fail(String(e.reason && e.reason.message || e.reason)));
+  if (typeof THREE === 'undefined') { fail('Three.js failed to load from cdnjs.'); return; }
+
+  // Try several builds/versions; the embedded-WASM builds need no extra .wasm fetch.
+  const CDN = 'https://cdn.jsdelivr.net/npm/jolt-physics@';
+  const candidates = [
+    CDN + '0.29.0/dist/jolt-physics.wasm-compat.js',
+    CDN + '0.29.0/dist/jolt-physics.js',
+    CDN + '0.30.0/dist/jolt-physics.wasm-compat.js',
+    CDN + '0.23.0/dist/jolt-physics.wasm-compat.js',
+  ];
+  let J = null, lastErr = '';
+  for (const url of candidates) {
+    try {
+      statusEl.textContent = 'Loading Jolt: ' + url.replace(CDN, '');
+      // Jolt's dist files are ES modules (they use import.meta), so load them with dynamic import()
+      const mod = await import(url);
+      const factory = mod.default || mod.Jolt || mod.initJolt;
+      if (typeof factory !== 'function') throw new Error('no Jolt factory exported by ' + url);
+      J = await factory();
+      if (!J || !J.JoltInterface) throw new Error('Jolt module incomplete');
+      break;
+    } catch (err) { lastErr = (err && err.message) || String(err); J = null; console.warn(url, err); }
+  }
+  if (!J) { fail('Jolt failed to load (' + lastErr + '). Open this file from a normal browser tab with internet access.'); return; }
+  statusEl.textContent = 'Ready.';
+  const RV = J.RVec3 || J.Vec3;        // position type (RVec3 in newer builds)
+
+  // ---------------------------------------------------------------- PHYSICS WORLD + COLLISION LAYERS
+  const LAYER_NON_MOVING = 0, LAYER_MOVING = 1, NUM_OBJECT_LAYERS = 2, NUM_BP_LAYERS = 2;
+  const jsettings = new J.JoltSettings();
+  const objFilter = new J.ObjectLayerPairFilterTable(NUM_OBJECT_LAYERS);
+  objFilter.EnableCollision(LAYER_NON_MOVING, LAYER_MOVING);   // world <-> dynamic/player
+  objFilter.EnableCollision(LAYER_MOVING, LAYER_MOVING);       // crates <-> crates / player
+  // (LAYER_NON_MOVING <-> LAYER_NON_MOVING intentionally disabled)
+  const bpInterface = new J.BroadPhaseLayerInterfaceTable(NUM_OBJECT_LAYERS, NUM_BP_LAYERS);
+  bpInterface.MapObjectToBroadPhaseLayer(LAYER_NON_MOVING, new J.BroadPhaseLayer(0));
+  bpInterface.MapObjectToBroadPhaseLayer(LAYER_MOVING, new J.BroadPhaseLayer(1));
+  jsettings.mObjectLayerPairFilter = objFilter;
+  jsettings.mBroadPhaseLayerInterface = bpInterface;
+  jsettings.mObjectVsBroadPhaseLayerFilter =
+    new J.ObjectVsBroadPhaseLayerFilterTable(bpInterface, NUM_BP_LAYERS, objFilter, NUM_OBJECT_LAYERS);
+
+  const jolt = new J.JoltInterface(jsettings);
+  J.destroy(jsettings);
+  const physics = jolt.GetPhysicsSystem();
+  const bodies = physics.GetBodyInterface();
+  const GRAVITY = -9.81;                                 // real-world gravity (m/s^2)
+  physics.SetGravity(new J.Vec3(0, GRAVITY, 0));
+
+  // ---------------------------------------------------------------- THREE.JS SCENE
+  const renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+  renderer.setSize(innerWidth, innerHeight);
+  renderer.shadowMap.enabled = true;
+  document.body.appendChild(renderer.domElement);
+
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x8fb4d9);
+  scene.fog = new THREE.Fog(0x8fb4d9, 40, 120);
+  const camera = new THREE.PerspectiveCamera(90, innerWidth / innerHeight, 0.05, 300);
+  camera.rotation.order = 'YXZ';
+  scene.add(camera);
+
+  scene.add(new THREE.HemisphereLight(0xdfeaff, 0x556655, 0.7));
+  const sun = new THREE.DirectionalLight(0xffffff, 0.9);
+  sun.position.set(25, 40, 15);
+  sun.castShadow = true;
+  sun.shadow.mapSize.set(2048, 2048);
+  Object.assign(sun.shadow.camera, { left: -40, right: 40, top: 40, bottom: -40, near: 1, far: 120 });
+  scene.add(sun);
+
+  // ---------------------------------------------------------------- WORLD BUILDERS
+  const dynamicBodies = [];  // { mesh, body }
+  const staticBoxes = [];    // axis-aligned static boxes [minx, miny, minz, maxx, maxy, maxz], used by the NPC ragdoll
+  function addBox(pos, half, color, euler, dynamic) {
+    if (!euler && !dynamic) staticBoxes.push([pos[0] - half[0], pos[1] - half[1], pos[2] - half[2], pos[0] + half[0], pos[1] + half[1], pos[2] + half[2]]);
+    const q = new THREE.Quaternion().setFromEuler(new THREE.Euler(euler ? euler[0] : 0, euler ? euler[1] : 0, euler ? euler[2] : 0));
+    const mesh = new THREE.Mesh(new THREE.BoxGeometry(half[0] * 2, half[1] * 2, half[2] * 2),
+      new THREE.MeshStandardMaterial({ color, roughness: 0.85 }));
+    mesh.position.set(pos[0], pos[1], pos[2]);
+    mesh.quaternion.copy(q);
+    mesh.castShadow = mesh.receiveShadow = true;
+    scene.add(mesh);
+
+    const shape = new J.BoxShape(new J.Vec3(half[0], half[1], half[2]), 0.02);
+    const cs = new J.BodyCreationSettings(shape, new RV(pos[0], pos[1], pos[2]),
+      new J.Quat(q.x, q.y, q.z, q.w),
+      dynamic ? J.EMotionType_Dynamic : J.EMotionType_Static,
+      dynamic ? LAYER_MOVING : LAYER_NON_MOVING);
+    if (dynamic) { cs.mMassPropertiesOverride.mMass = 40; cs.mFriction = 0.6; }
+    const body = bodies.CreateAndAddBody(cs, dynamic ? J.EActivation_Activate : J.EActivation_DontActivate);
+    J.destroy(cs);
+    if (dynamic) dynamicBodies.push({ mesh, id: body.GetID ? body.GetID() : body, home: { p: pos.slice(), q: [q.x, q.y, q.z, q.w] } });  // CreateAndAddBody returns a BodyID in newer builds
+    return mesh;
+  }
+
+  // Ground
+  const ground = addBox([0, -0.5, 0], [60, 0.5, 60], 0x6f8f5f);
+  const grid = new THREE.GridHelper(120, 120, 0x335533, 0x4c6b4c);
+  grid.position.y = 0.01;                              // (scene.add() returns the scene, so don't chain .position onto it)
+  scene.add(grid);
+  // Ramps: 20deg (walkable), 35deg (walkable), 60deg (too steep, slides off). Low edge faces the spawn (+Z) and sits
+  // flush with the ground; the slope rises toward -Z.
+  const ramp = (x, deg, c) => { const a = deg * Math.PI / 180;
+    addBox([x, 4 * Math.sin(a) - 0.2 * Math.cos(a), -10], [2, 0.2, 4], c, [a, 0, 0]); };
+  ramp(-8, 20, 0xb08968); ramp(-3, 35, 0xa07858); ramp(2, 60, 0x905848);
+  // Stairs (stair-stepping test): 8 steps, 0.25m rise each
+  for (let i = 0; i < 8; i++) addBox([10, (i + 1) * 0.125, 6 - i * 0.8], [2, (i + 1) * 0.125, 0.4], 0x9aa0a8);
+  addBox([10, 1.0, -1.0], [2, 1.0, 1.0], 0x9aa0a8);            // landing at the top
+  // Platforms & pillars to jump on
+  addBox([-10, 0.2, 8], [2, 0.2, 2], 0x7a6fa8);          // top 0.4 m (reachable from the ground)
+  addBox([-5, 0.4, 10], [2, 0.4, 2], 0x7a6fa8);           // top 0.8 m
+  addBox([0, 0.6, 12], [2, 0.6, 2], 0x7a6fa8);            // top 1.2 m
+  addBox([0, 1.5, -22], [8, 1.5, 1], 0xa86f6f);                  // wall
+  // Pushable crates (character pushes them via Jolt's character-vs-body interaction)
+  // (yellow crates removed)
+
+  // ---------------------------------------------------------------- 2. CHARACTER (CharacterVirtual capsule)
+  const PS = 0.65;                                   // player scale: 1 = 1.8 m tall, 0.65 = 35% smaller (collision capsule, eye height, body model, camera bob)
+  const RADIUS = 0.3 * PS, H_STAND = 1.8 * PS, H_CROUCH = 1.45 * PS;   // 0.6 m wide, 1.8 m tall (was a 1.0 m wide capsule: wider than a doorway-sized human)
+  let upperHidden = false;
+  const LOOK_DOWN_FWD = 0.07;                                // extra camera push forward (m) when looking straight down, so the view stays clear of the body
+  const FP_FWD = 0.17 * PS + 0.05;                                // first-person camera pushed forward of the body along the facing direction
+  // Camera sits at the character's eyes (head level). The crouch values are measured from the rig's own crouch pose: its eyes sit 0.815 m up
+  // (0.23 m lower than standing, not the old 0.36 m) and 0.08 m farther forward because the torso leans. The old 1.05 put the camera at shoulder height,
+  // inside the chest. The crouch capsule is now tall enough (eye 0.13 m under the top, same as standing) that the camera can't poke through a ceiling.
+  const EYE_STAND = 1.6 * PS, EYE_CROUCH = 1.25 * PS;
+  const CROUCH_FWD = 0.055;                                  // extra forward camera offset when fully crouched (the leaning torso carries the head forward)
+  const SPAWN = [0, 0.05, 16];                       // spawn FEET position
+  const capsule = h => new J.CapsuleShape((h - 2 * RADIUS) / 2, RADIUS);
+  const standShape = capsule(H_STAND), crouchShape = capsule(H_CROUCH);
+  let halfH = H_STAND / 2;                           // current capsule half-height (character origin = capsule centre)
+
+  const cset = new J.CharacterVirtualSettings();
+  cset.mShape = standShape;
+  cset.mUp = new J.Vec3(0, 1, 0);
+  cset.mMass = 80 * PS * PS * PS;                    // mass scales with volume
+  cset.mMaxSlopeAngle = 50 * Math.PI / 180;
+  cset.mMaxStrength = 200;
+  cset.mBackFaceMode = J.EBackFaceMode_CollideWithBackFaces;
+  cset.mCharacterPadding = 0.02;
+  cset.mPenetrationRecoverySpeed = 1;
+  cset.mPredictiveContactDistance = 0.1;
+  function makeCharacter(shape, x, y, z, h) {
+    cset.mShape = shape;
+    // only the lowest part of the lower cap counts as "ground". The plane is relative to the capsule centre and a
+    // contact is supporting when it is BELOW it (y < -constant), so the constant is +(h/2 - 0.8R).
+    cset.mSupportingVolume = new J.Plane(new J.Vec3(0, 1, 0), h / 2 - 0.8 * RADIUS);
+    return new J.CharacterVirtual(cset, new RV(x, y, z), J.Quat.prototype.sIdentity(), physics);
+  }
+  // Two pre-built characters (standing / crouching). Crouch swaps which one is active - nothing is ever
+  // destroyed or re-shaped at runtime, which avoids SetShape/destroy problems in some Jolt builds.
+  const charStand = makeCharacter(standShape, SPAWN[0], SPAWN[1] + H_STAND / 2, SPAWN[2], H_STAND);
+  const charCrouch = makeCharacter(crouchShape, SPAWN[0], SPAWN[1] + H_CROUCH / 2, SPAWN[2], H_CROUCH);
+  let character = charStand;
+
+  // Filters: the player queries as LAYER_MOVING -> collides with world + crates. The character is not a Body,
+  // so it can never collide with itself.
+  // Newer JoltPhysics.js builds expose these as classes built from the JoltInterface's filter tables;
+  // older builds had PhysicsSystem helpers. Support both.
+  const bpFilter = physics.GetDefaultBroadPhaseLayerFilter
+    ? physics.GetDefaultBroadPhaseLayerFilter(LAYER_MOVING)
+    : new J.DefaultBroadPhaseLayerFilter(jolt.GetObjectVsBroadPhaseLayerFilter(), LAYER_MOVING);
+  const layerFilter = physics.GetDefaultLayerFilter
+    ? physics.GetDefaultLayerFilter(LAYER_MOVING)
+    : new J.DefaultObjectLayerFilter(jolt.GetObjectLayerPairFilter(), LAYER_MOVING);
+  const bodyFilter = new J.BodyFilter();
+  const shapeFilter = new J.ShapeFilter();
+  const updSettings = new J.ExtendedUpdateSettings();       // defaults: stair step-up 0.4m, stick-to-floor 0.5m
+  // Ray casts. NOTE: Jolt 0.29+ changed NarrowPhaseQuery.CastRay to
+  //   CastRay(ray, settings, collector, bpFilter, layerFilter, bodyFilter, shapeFilter) -> void
+  // The old 5-argument form (ray, RayCastResult, filters...) silently misreads its arguments there: it never reports a hit
+  // and, when a hit is found, calls a virtual method on the wrong object, which corrupts memory and later shows up as
+  // "table index is out of bounds" inside some unrelated call (e.g. ExtendedUpdate). Use the collector form when the
+  // build has it and fall back to the old form otherwise.
+  const NEW_RAY_API = typeof J.CastRayClosestHitCollisionCollector === 'function' && typeof J.RayCastSettings === 'function';
+  const raySettings = NEW_RAY_API ? new J.RayCastSettings() : null;
+  const rayCollector = NEW_RAY_API ? new J.CastRayClosestHitCollisionCollector() : null;
+  // Returns the hit fraction (0..1 along the direction vector), or -1 if nothing was hit.
+  function castRay(ox, oy, oz, dx, dy, dz) {
+    const nq = physics.GetNarrowPhaseQuery();
+    let oV, dV, ray, hit;
+    try {
+      oV = new RV(ox, oy, oz); dV = new J.Vec3(dx, dy, dz); ray = new J.RRayCast(oV, dV);
+      if (NEW_RAY_API) {
+        rayCollector.Reset();
+        nq.CastRay(ray, raySettings, rayCollector, bpFilter, layerFilter, bodyFilter, shapeFilter);
+        return rayCollector.HadHit() ? rayCollector.mHit.mFraction : -1;
+      }
+      hit = new J.RayCastResult();
+      return nq.CastRay(ray, hit, bpFilter, layerFilter, bodyFilter) ? hit.mFraction : -1;
+    } finally { for (const w of [hit, ray, oV, dV]) if (w) J.destroy(w); }   // free every WASM object, even if the cast throws
+  }
+  const gravityVec = new J.Vec3(0, GRAVITY, 0);
+  const velVec = new J.Vec3(0, 0, 0);
+  const posVec = new RV(SPAWN[0], SPAWN[1] + halfH, SPAWN[2]);
+  // After teleporting a CharacterVirtual (SetPosition) its stored contacts are stale; Jolt's docs say to call
+  // RefreshContacts. We teleport the idle character on every stand/crouch switch, so do it there (and on respawn).
+  function refreshContacts(c) {
+    try { if (c.RefreshContacts) c.RefreshContacts(bpFilter, layerFilter, bodyFilter, shapeFilter, jolt.GetTempAllocator()); }
+    catch (e) { console.warn('RefreshContacts failed', e); }
+  }
+
+  // ---------------------------------------------------------------- 3. INPUT
+  const keys = {};
+  let yaw = 0, pitch = 0, locked = false, editorOpen = false, tpZoom = 1;   // editorOpen: Body editor panel (press B); tpZoom: third-person zoom
+  let yawT = 0, pitchT = 0;                          // mouse aim, applied directly (1:1)
+  let SENS = 0.0036; const SENS0 = 0.0036;   // mouse sensitivity (was 0.0022)
+  addEventListener('keydown', e => {
+    if (e.repeat) return;
+    keys[e.code] = true;
+    if (e.code === 'Space') { jumpBuffer = JUMP_BUFFER; e.preventDefault(); }
+    if (e.code === 'Backspace') respawn(true);
+  });
+  addEventListener('keyup', e => { keys[e.code] = false; });
+  const releaseKeys = () => { for (const k in keys) keys[k] = false; };
+  addEventListener('blur', releaseKeys);                                   // alt-tab / popups: never leave a key "held"
+  document.addEventListener('visibilitychange', () => { if (document.hidden) releaseKeys(); });
+  document.addEventListener('pointerlockerror', () => {
+    statusEl.textContent = 'Mouse capture was blocked. If this page is embedded in a frame, open it in its own tab.';
+    statusEl.style.color = '#ffb4b4';
+  });
+  // Ask for raw mouse input (no OS pointer acceleration, which is what makes long turns speed up); fall back if unsupported
+  const lockPointer = () => {
+    const el = renderer.domElement;
+    try {
+      const r = el.requestPointerLock({ unadjustedMovement: true });
+      if (r && r.catch) r.catch(() => el.requestPointerLock());
+    } catch (err) { el.requestPointerLock(); }
+  };
+  overlay.addEventListener('click', () => { lockPointer(); if (typeof audio === 'function') { const c = audio(); if (c && c.resume) c.resume(); } });
+  document.addEventListener('pointerlockchange', () => {
+    locked = document.pointerLockElement === renderer.domElement;
+    overlay.style.display = (locked || editorOpen) ? 'none' : 'flex';
+    if (!locked) for (const k in keys) keys[k] = false;
+  });
+  document.addEventListener('mousemove', e => {
+    if (!locked) return;
+    // Direct 1:1 look: the view turns exactly as far as the mouse moved, no added acceleration or lag
+    // Clamp per-event deltas: some browsers emit huge spikes during long continuous turns
+    const mx = Math.max(-120, Math.min(120, e.movementX)), my = Math.max(-120, Math.min(120, e.movementY));
+    lookInput(-mx * SENS, -my * SENS);   // mouse drives the muzzle first, the camera only gets the overflow (see weapon section)
+    yaw = yawT; pitch = pitchT;
+  });
+
+  // ---------------------------------------------------------------- PLAYER BODY (human-proportioned R15 character, 15 joints)
+  // Rig units are "studs", scaled so its total height matches the 1.8 m capsule.
+  const HEAD = { HR: 0.59, HL: 0.35, CAPF: 0.71, CAPN: 3, headY: -0.08, eyeX: 0.27, eyeS: 0.075, eyeY: 0.12, mouthW: 0.32, mouthY: -0.22 };
+  function buildRig() {
+    const S = H_STAND / 5.65;                        // 5.65 = rig height in studs
+    const mBody = new THREE.MeshStandardMaterial({ color: 0x5b7bdb, roughness: 0.75, metalness: 0 });   // one matte blue, like a clay posing mannequin
+    const mEye = new THREE.MeshStandardMaterial({ color: 0x4560c4, roughness: 0.6 });
+    const mEnd = new THREE.MeshStandardMaterial({ color: 0x141a3d, roughness: 0.6 });                    // dark open end of the slab hands
+    // First person: parts the camera sits inside stop drawing colour but still cast the player's shadow
+    const mHidden = new THREE.MeshBasicMaterial({ colorWrite: false, depthWrite: false });
+    const root = new THREE.Group(); scene.add(root);  // feet position + facing + scale
+    const fp = [], extras = [], P = {};
+    // Each of the 15 R15 parts gets a frame positioned every update by the Motor6D chain (see RA); meshes hang off the frame.
+    function frame(name) { const g = new THREE.Group(); g.matrixAutoUpdate = false; root.add(g); P[name] = g; return g; }
+    function add(g, geo, mat, x, y, z, hide) {
+      const m = new THREE.Mesh(geo, mat); m.castShadow = true; m.position.set(x, y, z);
+      g.add(m); if (hide) fp.push({ mesh: m, mat });
+      return m;
+    }
+    // Rounded box (w x h x d, corner radius r): a box whose vertices are pushed out from an inner box, with analytic smooth normals
+    function roundBox(w, h, d, r) {
+      const sg = len => Math.max(2, Math.min(20, Math.ceil(len / r * 2.2)));
+      const g = new THREE.BoxGeometry(w, h, d, sg(w), sg(h), sg(d));
+      const p = g.attributes.position, n = g.attributes.normal, hx = w / 2 - r, hy = h / 2 - r, hz = d / 2 - r, v = new THREE.Vector3(), c = new THREE.Vector3();
+      for (let i = 0; i < p.count; i++) {
+        v.fromBufferAttribute(p, i);
+        c.set(Math.max(-hx, Math.min(hx, v.x)), Math.max(-hy, Math.min(hy, v.y)), Math.max(-hz, Math.min(hz, v.z)));
+        v.sub(c).normalize();
+        n.setXYZ(i, v.x, v.y, v.z);
+        p.setXYZ(i, c.x + v.x * r, c.y + v.y * r, c.z + v.z * r);
+      }
+      return g;
+    }
+    // Capsule / pill (round cross-section, hemispherical ends): height h, top radius rT, bottom radius rB (equal = straight pill)
+    function taperCap(h, rT, rB) {
+      const pts = [], N = 12, cb = -h / 2 + rB, ct = h / 2 - rT;
+      for (let i = 0; i <= N; i++) { const a = -Math.PI / 2 + (Math.PI / 2) * i / N; pts.push(new THREE.Vector2(Math.max(1e-4, rB * Math.cos(a)), cb + rB * Math.sin(a))); }
+      for (let i = 0; i <= N; i++) { const a = (Math.PI / 2) * i / N; pts.push(new THREE.Vector2(Math.max(1e-4, rT * Math.cos(a)), ct + rT * Math.sin(a))); }
+      return new THREE.LatheGeometry(pts, 32);
+    }
+    // ---- Editable part table. Every entry is one mesh (or a left/right pair). The in-game Body editor (press B) changes CFG live.
+    // hide:true parts (head, neck, eyes) are not drawn in first person because the camera is inside them; everything else stays visible.
+    // Defaults were measured from the reference mannequin image (rig units = studs, 5.65 tall).
+    // kinds: pill (h, r) | rbox (w, h, d, c = corner rounding) | box (w, h, d) | sphere (r) | eyes (r, sx = spacing)
+    const D = o => Object.assign({ x: 0, y: 0, z: 0, rx: 0, ry: 0, rz: 0 }, o);
+    const PART_DEFS = {
+      head:     { label: 'Head',                 frame: 'Head',       kind: 'pill',   hide: true,  def: D({ y: -0.04, h: 0.78, r: 0.31 }) },
+      eyes:     { label: 'Eyes',                 frame: 'Head',       kind: 'eyes',   hide: true,  def: D({ y: 0.02, z: -0.275, r: 0.06, sx: 0.13 }) },
+      neck:     { label: 'Neck',                 frame: 'Neck',       kind: 'pill',   hide: true,  def: D({ y: 0.19, h: 0.475, r: 0.185 }) },
+      chest:    { label: 'Chest',                frame: 'Chest',      kind: 'rbox',   hide: false,  def: D({ y: 0.2, w: 1.21, h: 0.74, d: 0.72, c: 0.5 }) },
+      belly1:   { label: 'Belly - upper band',   frame: 'Spine',      kind: 'rbox',   hide: false,  def: D({ y: 0.2, w: 1.025, h: 0.735, d: 0.675, c: 0.5 }) },
+      belly2:   { label: 'Belly - middle band',  frame: 'UpperTorso', kind: 'rbox',   hide: false,  def: D({ y: -0.375, w: 1.02, h: 0.71, d: 0.675, c: 0.5 }) },
+      belly3:   { label: 'Belly - lower band',   frame: 'UpperTorso', kind: 'rbox',   hide: false,  def: D({ y: -0.72, w: 1.045, h: 0.64, d: 0.665, c: 0.5 }) },
+      pelvis:   { label: 'Pelvis',               frame: 'LowerTorso', kind: 'rbox',   hide: false, def: D({ y: -0.03, w: 1.16, h: 0.735, d: 0.675, c: 0.5 }) },
+      shoulder: { label: 'Shoulder ball (L+R)',  frame: 'UpperArm',   kind: 'sphere', hide: false,  sided: true, def: D({ x: -0.02, y: 0.43, r: 0.185 }) },
+      upperArm: { label: 'Upper arm (L+R)',      frame: 'UpperArm',   kind: 'pill',   hide: false,  sided: true, def: D({ x: -0.02, h: 1.04, r: 0.17 }) },
+      lowerArm: { label: 'Lower arm (L+R)',      frame: 'LowerArm',   kind: 'pill',   hide: false,  sided: true, def: D({ x: -0.02, y: -0.03, h: 1.05, r: 0.14 }) },
+      hand:     { label: 'Hand (L+R)',           frame: 'Hand',       kind: 'box',    hide: false,  sided: true, mat: 'hand', def: D({ w: 0.105, h: 0.355, d: 0.355 }) },
+      upperLeg: { label: 'Upper leg (L+R)',      frame: 'UpperLeg',   kind: 'pill',   hide: false, sided: true, def: D({ y: -0.085, h: 1.645, r: 0.28 }) },
+      lowerLeg: { label: 'Lower leg (L+R)',      frame: 'LowerLeg',   kind: 'pill',   hide: false, sided: true, def: D({ y: -0.23, h: 1.46, r: 0.24 }) },
+      foot:     { label: 'Foot (L+R)',           frame: 'Foot',       kind: 'box',    hide: false, sided: true, def: D({ y: -0.05, z: 0.12, w: 0.38, h: 0.215, d: 0.48 }) },
+      toes:     { label: 'Toes (L+R)',           frame: 'Toes',       kind: 'box',    hide: false, sided: true, def: D({ y: 0.05, z: -0.12, w: 0.38, h: 0.2, d: 0.24 }) },
+    };
+    const CFG = {}, meshes = {};
+    for (const k in PART_DEFS) CFG[k] = Object.assign({}, PART_DEFS[k].def);
+    const DEFCFG = JSON.parse(JSON.stringify(CFG));
+    function makeGeo(kind, c) {
+      if (kind === 'pill') return taperCap(Math.max(c.h, c.r * 2 + 0.01), c.r, c.r);
+      if (kind === 'rbox') return roundBox(c.w, c.h, c.d, Math.max(0.03, Math.min(c.c, Math.min(c.w, c.h, c.d) / 2 - 0.002)));
+      if (kind === 'box') return new THREE.BoxGeometry(c.w, c.h, c.d);
+      return new THREE.SphereGeometry(c.r, kind === 'eyes' ? 16 : 28, kind === 'eyes' ? 12 : 20);
+    }
+    // frames first (each name exactly once), then the meshes that hang off them
+    for (const n of ['LowerTorso', 'UpperTorso', 'Spine', 'Chest', 'Neck', 'Head']) frame(n);
+    for (const sd of ['Right', 'Left']) for (const n of ['Clavicle', 'UpperArm', 'LowerArm', 'Hand', 'UpperLeg', 'LowerLeg', 'Foot', 'Toes']) frame(sd + n);
+    for (const key in PART_DEFS) {
+      const d = PART_DEFS[key];
+      const mat = d.mat === 'hand' ? [mBody, mBody, mBody, mEnd, mBody, mBody] : d.kind === 'eyes' ? mEye : mBody;
+      const slots = d.kind === 'eyes' ? [['', -1], ['', 1]] : d.sided ? [['Right', 1], ['Left', -1]] : [['', 1]];
+      meshes[key] = [];
+      for (const [sd, sign] of slots) {
+        const mesh = new THREE.Mesh(makeGeo(d.kind, CFG[key]), mat);
+        mesh.castShadow = true; mesh.userData.part = key;
+        P[sd + d.frame].add(mesh);
+        if (d.kind === 'eyes') extras.push(mesh); else if (d.hide) fp.push({ mesh, mat });
+        meshes[key].push({ mesh, sign, wire: null });
+      }
+    }
+    const DEG = Math.PI / 180;
+    function applyPart(key) {
+      const d = PART_DEFS[key], c = CFG[key];
+      for (const m of meshes[key]) {
+        const old = m.mesh.geometry; m.mesh.geometry = makeGeo(d.kind, c); old.dispose();
+        if (d.kind === 'eyes') { m.mesh.position.set(m.sign * c.sx, c.y, c.z); m.mesh.scale.set(1, 1, 0.8); }
+        else { const sg = d.sided ? m.sign : 1; m.mesh.position.set(sg * c.x, c.y, c.z); m.mesh.rotation.set(c.rx * DEG, sg * c.ry * DEG, sg * c.rz * DEG); }
+        if (m.wire) { m.wire.geometry.dispose(); m.wire.geometry = new THREE.WireframeGeometry(m.mesh.geometry); }
+      }
+    }
+    function applyAll() { for (const k in PART_DEFS) applyPart(k); }
+    applyAll();
+    // selection outline (yellow wireframe drawn on top) used by the Body editor
+    const selMat = new THREE.LineBasicMaterial({ color: 0xffe14d, depthTest: false, transparent: true, opacity: 0.9 });
+    function setSelected(key) {
+      for (const k in meshes) for (const m of meshes[k]) if (m.wire) { m.mesh.remove(m.wire); m.wire.geometry.dispose(); m.wire = null; }
+      if (!key || !meshes[key]) return;
+      for (const m of meshes[key]) {
+        const w = new THREE.LineSegments(new THREE.WireframeGeometry(m.mesh.geometry), selMat);
+        w.renderOrder = 999; w.raycast = () => {}; m.mesh.add(w); m.wire = w;
+      }
+    }
+    return { root, P, fp, extras, S, hidden: mHidden, PART_DEFS, CFG, DEFCFG, meshes, applyPart, applyAll, setSelected };
+  }
+  const R = buildRig();
+
+  // ---------------------------------------------------------------- NPC: a second copy of the player's character
+  const NPC = buildRig();
+  for (const p of NPC.fp) p.mesh.material = p.mat;        // the NPC is always fully drawn (head, neck, eyes included)
+  for (const m of NPC.extras) m.visible = true;
+  const NPC_POS = [3.5, 0.05, 13];                          // feet position, a few metres in front of the spawn
+  NPC.root.position.set(NPC_POS[0], NPC_POS[1], NPC_POS[2]);
+  NPC.root.scale.setScalar(NPC.S);
+  let npcFace = 0;                                          // facing angle (same convention as the player's rig: forward = (-sin, -cos))
+  function syncNpc() {                                      // keep the NPC's body in step with the Body editor settings
+    for (const k in R.CFG) Object.assign(NPC.CFG[k], R.CFG[k]);
+    NPC.applyAll();
+  }
+  // static capsule so the player can't walk through the NPC (and bullets hit it)
+  let NPC_ID = null, NPC_IDX = -1;
+  {
+    const sh = new J.CapsuleShape((H_STAND - 2 * RADIUS) / 2, RADIUS);
+    const cs = new J.BodyCreationSettings(sh, new RV(NPC_POS[0], NPC_POS[1] + H_STAND / 2, NPC_POS[2]), J.Quat.prototype.sIdentity(), J.EMotionType_Static, LAYER_NON_MOVING);
+    const nb = bodies.CreateAndAddBody(cs, J.EActivation_DontActivate);
+    J.destroy(cs);
+    NPC_ID = nb.GetID ? nb.GetID() : nb;
+    NPC_IDX = NPC_ID.GetIndex();
+  }
+  // Health: body shot = 34 (3 hits), headshot = instant kill. Dies by falling backwards, respawns after 5 s (or on Backspace).
+  const npc = { hp: 100, dead: false, deadT: 0, hit: 0, mat: NPC.meshes.chest[0].mesh.material };
+  // ---- Ragdoll: a Verlet particle skeleton (15 joints, distance constraints) in the rig's own stud units. It starts from the last
+  // animated pose, gets a push from the killing bullet, then falls under gravity, collides with the ground / platforms / stairs / wall,
+  // and the rig's parts are laid onto the particles every frame.
+  const RAG_R = { pel: 0.4, neck: 0.35, head: 0.4, shR: 0.25, shL: 0.25, elR: 0.2, elL: 0.2, wrR: 0.15, wrL: 0.15, hipR: 0.3, hipL: 0.3, knR: 0.25, knL: 0.25, anR: 0.3, anL: 0.3 };
+  const RAG_LINKS = [['pel', 'hipR'], ['pel', 'hipL'], ['hipR', 'hipL'], ['pel', 'neck'], ['neck', 'shR'], ['neck', 'shL'], ['shR', 'shL'], ['hipR', 'neck'], ['hipL', 'neck'],
+    ['shR', 'pel'], ['shL', 'pel'], ['neck', 'head'], ['shR', 'elR'], ['elR', 'wrR'], ['shL', 'elL'], ['elL', 'wrL'], ['hipR', 'knR'], ['knR', 'anR'], ['hipL', 'knL'], ['knL', 'anL'],
+    ['head', 'shR', 0.5], ['head', 'shL', 0.5]];
+  const RAG_MIN = [['hipR', 'knR', 'anR', 0.35], ['hipL', 'knL', 'anL', 0.35], ['shR', 'elR', 'wrR', 0.25], ['shL', 'elL', 'wrL', 0.25]];   // ends can't fold closer than this fraction of the limb length
+  // Muscle strength per joint (how hard the joint is pulled back to its living pose, relative to the torso). The tone is full at the moment
+  // of death and bleeds away over about half a second, so the body briefly holds itself and then goes limp; a faint residual tone stays.
+  const RAG_MUSCLE = { head: 0.5, elR: 0.5, elL: 0.5, wrR: 0.4, wrL: 0.4, knR: 0.7, knL: 0.7, anR: 0.5, anL: 0.5 };
+  // Joint range of motion in degrees, measured from the rest direction: [forward, backward, outward, inward]
+  const RAG_LIM_LEG = [125, 25, 50, 25], RAG_LIM_ARM = [170, 55, 150, 35], RAG_LIM_HEAD = [50, 55, 40, 40];
+  function ragFrame(g) {                                        // the torso's frame (X right, Y up, Z back) from its particles
+    const V3 = THREE.Vector3, pv = n => g.ps[g.idx[n]].p;
+    const Y = new V3().subVectors(pv('neck'), pv('pel')).normalize();
+    const X = new V3().subVectors(pv('shR'), pv('shL')).add(new V3().subVectors(pv('hipR'), pv('hipL')));
+    X.addScaledVector(Y, -X.dot(Y)).normalize();
+    return { X, Y, Z: new V3().crossVectors(X, Y), pel: pv('pel') };
+  }
+  function ragLimits(g, fr) {
+    const V3 = THREE.Vector3, P = n => g.ps[g.idx[n]].p, D = Math.PI / 180;
+    // ball joints (hip, shoulder, neck): the limb's direction may only swing so far from its rest direction, and less far in some directions
+    const cone = (an, bn, refSgn, lim, side) => {
+      const A = P(an), B = P(bn), d = new V3().subVectors(B, A), len = d.length(); if (len < 1e-6) return; d.divideScalar(len);
+      const dx = d.dot(fr.X) * side, dz = d.dot(fr.Z), th = Math.acos(Math.max(-1, Math.min(1, d.dot(fr.Y) * refSgn))), hh = Math.hypot(dx, dz);
+      if (hh < 1e-4) return;
+      const hx = dx / hh, hz = dz / hh;
+      const mx = ((hz < 0 ? lim[0] : lim[1]) * hz * hz + (hx > 0 ? lim[2] : lim[3]) * hx * hx) * D;
+      if (th <= mx) return;
+      const nd = fr.Y.clone().multiplyScalar(Math.cos(mx) * refSgn).addScaledVector(fr.X, hx * side * Math.sin(mx)).addScaledVector(fr.Z, hz * Math.sin(mx));
+      B.lerp(A.clone().addScaledVector(nd, len), 0.6);
+    };
+    // hinge joints (knee, elbow): they only bend one way. The knee point must stay on the front side of the hip-ankle line, the elbow on the back side.
+    const hinge = (hn, kn, en, sgn) => {
+      const H = P(hn), K = P(kn), E = P(en), u = new V3().subVectors(E, H); if (u.lengthSq() < 1e-8) return; u.normalize();
+      const s = new V3().crossVectors(fr.X, u); if (s.lengthSq() < 1e-6) return; s.normalize();
+      const o = K.clone().sub(H.clone().add(E).multiplyScalar(0.5)).dot(s);
+      if (sgn * o < 0) K.addScaledVector(s, -o);
+    };
+    for (const k of ['R', 'L']) {
+      const side = k === 'R' ? 1 : -1;
+      cone('hip' + k, 'kn' + k, -1, RAG_LIM_LEG, side); cone('sh' + k, 'el' + k, -1, RAG_LIM_ARM, side);
+      hinge('hip' + k, 'kn' + k, 'an' + k, 1); hinge('sh' + k, 'el' + k, 'wr' + k, -1);
+    }
+    cone('neck', 'head', 1, RAG_LIM_HEAD, 1);
+  }
+  function ragStart(hp, hv) {
+    const S = NPC.S, V3 = THREE.Vector3;
+    const M = npc.lastM || RA.pose([{ a: ANIMS.idle, t: 0, w: 1 }], { yaw: 0, pitch: 0, lean: 0, bank: 0, sq: 0 });
+    const cf = Math.cos(npcFace), sf = Math.sin(npcFace);
+    const W = v => new V3(v.x * cf + v.z * sf + NPC_POS[0] / S, v.y + NPC_POS[1] / S, -v.x * sf + v.z * cf + NPC_POS[2] / S);   // rig space -> world, in studs
+    const org = n => W(new V3(M[n][12], M[n][13], M[n][14]));
+    const jnt = n => { const m = M[n], c = RA.C1[n], x = c[12], y = c[13], z = c[14];
+      return W(new V3(m[0] * x + m[4] * y + m[8] * z + m[12], m[1] * x + m[5] * y + m[9] * z + m[13], m[2] * x + m[6] * y + m[10] * z + m[14])); };
+    const pos = { pel: org('LowerTorso'), neck: org('Neck'), head: org('Head') };
+    for (const s of ['Right', 'Left']) {
+      const k = s[0];
+      pos['sh' + k] = jnt(s + 'UpperArm'); pos['el' + k] = jnt(s + 'LowerArm'); pos['wr' + k] = jnt(s + 'Hand');
+      pos['hip' + k] = jnt(s + 'UpperLeg'); pos['kn' + k] = jnt(s + 'LowerLeg'); pos['an' + k] = jnt(s + 'Foot');
+    }
+    const ps = [], idx = {};
+    Object.keys(RAG_R).forEach((n, i) => { idx[n] = i; ps.push({ p: pos[n], o: pos[n].clone(), r: RAG_R[n], hit: false }); });
+    const dir = hv ? hv.clone().normalize() : new V3(0, 0, 1), hs = hp.clone().divideScalar(S);
+    for (const q of ps) {                                       // the shot shoves the joints near the impact hardest, everything gets a little
+      const dm = q.p.distanceTo(hs) * S, w = Math.exp(-(dm * dm) / 0.25);
+      q.o.addScaledVector(dir, -(0.4 + 2.2 * w) / S / 120);      // gentle: a shot staggers the body, it doesn't launch it
+    }
+    const dist = (a, b) => ps[idx[a]].p.distanceTo(ps[idx[b]].p);
+    npc.rag = {
+      ps, idx, G: -9.81 / S,
+      links: RAG_LINKS.map(l => ({ a: idx[l[0]], b: idx[l[1]], rest: dist(l[0], l[1]), k: l[2] || 1 })),
+      mins: RAG_MIN.map(l => ({ a: idx[l[0]], b: idx[l[2]], rest: l[3] * (dist(l[0], l[1]) + dist(l[1], l[2])) })),
+      boxes: staticBoxes.map(b => b.map(v => v / S)),
+    };
+    const g = npc.rag, fr = ragFrame(g);
+    g.start = ps[idx.pel].p.clone();
+    g.muscle = Object.keys(RAG_MUSCLE).map(n => {               // each muscle remembers where its joint sits in the torso's frame in the living pose
+      const d = new V3().subVectors(ps[idx[n]].p, fr.pel);
+      return { i: idx[n], k: RAG_MUSCLE[n], l: [d.dot(fr.X), d.dot(fr.Y), d.dot(fr.Z)] };
+    });
+    NPC.root.position.set(0, 0, 0); NPC.root.rotation.set(0, 0, 0); NPC.root.scale.setScalar(S);   // ragdoll lives in world-stud space
+  }
+  function ragStep(fdt) {
+    const g = npc.rag; if (!g) return;
+    const ps = g.ps, V = new THREE.Vector3();
+    const tone = 0.02 + 0.98 * Math.exp(-npc.deadT / 0.3), vmax = 4 / NPC.S;   // muscle tone fades; no joint may move faster than 4 m/s
+    const pull = (A, B, rest, k, onlyShort) => {
+      V.subVectors(B, A); const d = V.length() || 1e-6;
+      if (onlyShort && d >= rest) return;
+      const f = (d - rest) / d * 0.5 * k; A.addScaledVector(V, f); B.addScaledVector(V, -f);
+    };
+    for (let rem = Math.min(fdt, 1 / 30); rem > 0;) {
+      const h = Math.min(rem, 1 / 120); rem -= h;
+      for (const q of ps) { V.subVectors(q.p, q.o); const vl = V.length(); if (vl > vmax * h) V.multiplyScalar(vmax * h / vl); q.o.copy(q.p); q.p.addScaledVector(V, 0.995); q.p.y += g.G * h * h; q.hit = false; }
+      for (let it = 0; it < 8; it++) {
+        for (const c of g.links) pull(ps[c.a].p, ps[c.b].p, c.rest, c.k, false);
+        for (const c of g.mins) pull(ps[c.a].p, ps[c.b].p, c.rest, 1, true);
+        const fr = ragFrame(g);
+        for (const m of g.muscle) {                              // muscles: pull each joint toward its pose in the torso's frame, scaled by the fading tone
+          const p = ps[m.i].p, a = 0.2 * m.k * tone;
+          p.x += (fr.pel.x + fr.X.x * m.l[0] + fr.Y.x * m.l[1] + fr.Z.x * m.l[2] - p.x) * a;
+          p.y += (fr.pel.y + fr.X.y * m.l[0] + fr.Y.y * m.l[1] + fr.Z.y * m.l[2] - p.y) * a;
+          p.z += (fr.pel.z + fr.X.z * m.l[0] + fr.Y.z * m.l[1] + fr.Z.z * m.l[2] - p.z) * a;
+        }
+        ragLimits(g, fr);                                        // joints only bend through their real range of motion
+        for (const q of ps) {
+          const p = q.p, r = q.r;
+          for (const b of g.boxes) {
+            if (p.x < b[0] - r || p.x > b[3] + r || p.y < b[1] - r || p.y > b[4] + r || p.z < b[2] - r || p.z > b[5] + r) continue;
+            const d = [p.x - (b[0] - r), (b[3] + r) - p.x, p.y - (b[1] - r), (b[4] + r) - p.y, p.z - (b[2] - r), (b[5] + r) - p.z];
+            let m = 0; for (let i = 1; i < 6; i++) if (d[i] < d[m]) m = i;
+            if (m === 0) p.x = b[0] - r; else if (m === 1) p.x = b[3] + r; else if (m === 2) p.y = b[1] - r; else if (m === 3) p.y = b[4] + r; else if (m === 4) p.z = b[2] - r; else p.z = b[5] + r;
+            q.hit = true;
+          }
+          if (p.y < r) { p.y = r; q.hit = true; }
+        }
+      }
+      for (const q of ps) if (q.hit) q.o.lerp(q.p, 0.3);         // contact friction: scrapes off speed
+      const pp = ps[g.idx.pel].p;
+      if (Math.hypot(pp.x - g.start.x, pp.z - g.start.z) > 0.9 / NPC.S)   // slid more than ~0.9 m from where it died: drag the sliding to a stop
+        for (const q of ps) { q.o.x += (q.p.x - q.o.x) * 0.3; q.o.z += (q.p.z - q.o.z) * 0.3; }
+    }
+    ragPose(g);
+  }
+  function ragPose(g) {
+    const V3 = THREE.Vector3, P = NPC.P, pv = n => g.ps[g.idx[n]].p;
+    const setB = (fr, X, Y, Z, pos) => { fr.matrix.makeBasis(X, Y, Z).setPosition(pos); fr.matrixWorldNeedsUpdate = true; };
+    const perp = (X, Y) => X.clone().addScaledVector(Y, -X.dot(Y)).normalize();
+    const pel = pv('pel'), neck = pv('neck'), head = pv('head');
+    const Y = new V3().subVectors(neck, pel).normalize();
+    const X = perp(new V3().subVectors(pv('shR'), pv('shL')).add(new V3().subVectors(pv('hipR'), pv('hipL'))), Y), Z = new V3().crossVectors(X, Y);
+    setB(P.LowerTorso, X, Y, Z, pel);
+    setB(P.UpperTorso, X, Y, Z, pel.clone().addScaledVector(Y, 1.0));
+    setB(P.Spine, X, Y, Z, pel.clone().addScaledVector(Y, 0.8));
+    setB(P.Chest, X, Y, Z, pel.clone().addScaledVector(Y, 1.25));
+    setB(P.Neck, X, Y, Z, neck);
+    const Yh = new V3().subVectors(head, neck).normalize(), Xh = perp(X, Yh);
+    setB(P.Head, Xh, Yh, new V3().crossVectors(Xh, Yh), head);
+    for (const s of ['Right', 'Left']) {
+      const k = s[0], sh = pv('sh' + k), el = pv('el' + k), wr = pv('wr' + k), hip = pv('hip' + k), kn = pv('kn' + k), an = pv('an' + k);
+      ikSegment(P[s + 'UpperArm'], sh, el, 0.86);
+      ikSegment(P[s + 'LowerArm'], el, wr, 0.8);
+      const Yw = new V3().subVectors(el, wr).normalize(), Xw = perp(X, Yw);
+      setB(P[s + 'Hand'], Xw, Yw, new V3().crossVectors(Xw, Yw), wr.clone().addScaledVector(Yw, -0.23));
+      ikSegment(P[s + 'UpperLeg'], hip, kn, 1.08);
+      ikSegment(P[s + 'LowerLeg'], kn, an, 1.2);
+      const Yf = new V3().subVectors(kn, an).normalize(), Xf = perp(X, Yf), Zf = new V3().crossVectors(Xf, Yf);
+      const fo = an.clone().addScaledVector(Yf, -0.2).addScaledVector(Zf, -0.19);
+      setB(P[s + 'Foot'], Xf, Yf, Zf, fo);
+      setB(P[s + 'Toes'], Xf, Yf, Zf, fo.clone().addScaledVector(Yf, -0.1).addScaledVector(Zf, -0.12));
+    }
+  }
+  function moveNpcBody(away) {                              // park the collider far below the map while dead so you can walk over the body
+    const pv = new RV(NPC_POS[0], away ? -100 : NPC_POS[1] + H_STAND / 2, NPC_POS[2]);
+    try { bodies.SetPosition(NPC_ID, pv, J.EActivation_DontActivate); } catch (e) { console.warn('npc collider move failed', e); }
+    J.destroy(pv);
+  }
+  function npcHit(p, hv) {
+    if (npc.dead) return;
+    const head = (p.y - NPC_POS[1]) > H_STAND * 0.82;
+    npc.hp -= head ? 100 : 34; npc.hit = 1; thud(0.08, 300);
+    if (npc.hp <= 0) { npc.dead = true; npc.deadT = 0; moveNpcBody(true); ragStart(p, hv); }
+  }
+  function npcRevive() {
+    npc.dead = false; npc.hp = 100; npc.hit = 0;
+    npc.rag = null;
+    NPC.root.position.set(NPC_POS[0], NPC_POS[1], NPC_POS[2]); NPC.root.rotation.set(0, npcFace, 0, 'YXZ'); NPC.root.scale.setScalar(NPC.S);
+    moveNpcBody(false);
+  }
+
+  let thirdPerson = false;
+  function applyRigView() {                           // first person: hide torso/arms/head (camera is inside them); legs stay
+    const hide = !thirdPerson;
+    for (const p of R.fp) {
+      p.mesh.material = hide ? R.hidden : p.mat;
+      p.mesh.children.forEach(c => { if (c.isLineSegments) c.visible = !hide; });
+    }
+    for (const m of R.extras) m.visible = !hide;
+  }
+  applyRigView();
+  let camMode = 0;                                   // 0 = first person, 1 = third person (behind), 2 = third person (front, facing the player)
+  addEventListener('keydown', e => { if (e.code === 'KeyV' && !e.repeat) { camMode = (camMode + 1) % 3; thirdPerson = camMode > 0; applyRigView(); } });
+  const tpFwd = new THREE.Vector3();
+  let footEvt = 0, animStepRate = 1.5, animInfo = '', animMsg = '', animMsgAt = -1e9;
+  const cl = (v, a, b) => Math.max(a, Math.min(b, v)), mix = (a, b, t) => a + (b - a) * t;
+  // =====================================================================================================
+  // ROBLOX R15 ANIMATIONS. The body is an R15 rig (15 parts / Motor6D joints); poses come from KeyframeSequence data.
+  // Export your R15 animations from Studio with export_r15_animations.luau, then drag the .json onto this page.
+  // =====================================================================================================
+  // RA-BEGIN
+  const RA = (function () {
+    const TAU = Math.PI * 2;
+    // ---- tiny 4x4 matrix / quaternion helpers (column-major arrays, same layout as three.js)
+    const mul = (a, b) => { const o = new Array(16); for (let c = 0; c < 4; c++) for (let r = 0; r < 4; r++) { let s = 0; for (let k = 0; k < 4; k++) s += a[k * 4 + r] * b[c * 4 + k]; o[c * 4 + r] = s; } return o; };
+    const trans = (x, y, z) => [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, x, y, z, 1];
+    const rotX = a => { const c = Math.cos(a), s = Math.sin(a); return [1, 0, 0, 0, 0, c, s, 0, 0, -s, c, 0, 0, 0, 0, 1]; };
+    const rotY = a => { const c = Math.cos(a), s = Math.sin(a); return [c, 0, -s, 0, 0, 1, 0, 0, s, 0, c, 0, 0, 0, 0, 1]; };
+    const rotZ = a => { const c = Math.cos(a), s = Math.sin(a); return [c, s, 0, 0, -s, c, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]; };
+    const fromRows = (x, y, z, r00, r01, r02, r10, r11, r12, r20, r21, r22) => [r00, r10, r20, 0, r01, r11, r21, 0, r02, r12, r22, 0, x, y, z, 1];
+    const inv = m => {                                   // rigid-body inverse (rotation + translation only)
+      const o = [m[0], m[4], m[8], 0, m[1], m[5], m[9], 0, m[2], m[6], m[10], 0, 0, 0, 0, 1];
+      o[12] = -(o[0] * m[12] + o[4] * m[13] + o[8] * m[14]);
+      o[13] = -(o[1] * m[12] + o[5] * m[13] + o[9] * m[14]);
+      o[14] = -(o[2] * m[12] + o[6] * m[13] + o[10] * m[14]);
+      return o;
+    };
+    const qFromM = m => {
+      const m11 = m[0], m12 = m[4], m13 = m[8], m21 = m[1], m22 = m[5], m23 = m[9], m31 = m[2], m32 = m[6], m33 = m[10], tr = m11 + m22 + m33;
+      let x, y, z, w;
+      if (tr > 0) { const s = 0.5 / Math.sqrt(tr + 1); w = 0.25 / s; x = (m32 - m23) * s; y = (m13 - m31) * s; z = (m21 - m12) * s; }
+      else if (m11 > m22 && m11 > m33) { const s = 2 * Math.sqrt(1 + m11 - m22 - m33); w = (m32 - m23) / s; x = 0.25 * s; y = (m12 + m21) / s; z = (m13 + m31) / s; }
+      else if (m22 > m33) { const s = 2 * Math.sqrt(1 + m22 - m11 - m33); w = (m13 - m31) / s; x = (m12 + m21) / s; y = 0.25 * s; z = (m23 + m32) / s; }
+      else { const s = 2 * Math.sqrt(1 + m33 - m11 - m22); w = (m21 - m12) / s; x = (m13 + m31) / s; y = (m23 + m32) / s; z = 0.25 * s; }
+      const n = Math.hypot(x, y, z, w) || 1;
+      return [x / n, y / n, z / n, w / n];
+    };
+    const mFromQP = (q, p) => {
+      const x = q[0], y = q[1], z = q[2], w = q[3], x2 = x + x, y2 = y + y, z2 = z + z;
+      const xx = x * x2, xy = x * y2, xz = x * z2, yy = y * y2, yz = y * z2, zz = z * z2, wx = w * x2, wy = w * y2, wz = w * z2;
+      return [1 - (yy + zz), xy + wz, xz - wy, 0, xy - wz, 1 - (xx + zz), yz + wx, 0, xz + wy, yz - wx, 1 - (xx + yy), 0, p[0], p[1], p[2], 1];
+    };
+    const slerp = (a, b, t) => {
+      let d = a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3], sg = 1;
+      if (d < 0) { d = -d; sg = -1; }
+      let k0, k1;
+      if (d > 0.9995) { k0 = 1 - t; k1 = t * sg; }
+      else { const th = Math.acos(d), sn = Math.sin(th); k0 = Math.sin((1 - t) * th) / sn; k1 = Math.sin(t * th) / sn * sg; }
+      const o = [a[0] * k0 + b[0] * k1, a[1] * k0 + b[1] * k1, a[2] * k0 + b[2] * k1, a[3] * k0 + b[3] * k1];
+      const n = Math.hypot(o[0], o[1], o[2], o[3]) || 1;
+      return [o[0] / n, o[1] / n, o[2] / n, o[3] / n];
+    };
+    const lerp = (a, b, t) => a + (b - a) * t;
+
+    // ---- Roblox R15 rig: 15 Motor6D joints (Root, Waist, Neck, 2x shoulder / elbow / wrist, 2x hip / knee / ankle).
+    // KeyframeSequence pose names are the child part names. R15 C0/C1 have no rotation, so a pose rotation is expressed
+    // directly in the parent part's axes (X right, Y up, Z back); part CFrame = parent * C0 * Transform * C1^-1.
+    // Joint positions are human proportions in studs (about 5.65 tall); the body is built to match in buildRig.
+    const JOINT_DEFS = [
+      // part, parent, C0 (on parent), C1 (on part). The spine is a 4-segment chain (UpperTorso = abdomen, Spine, Chest, Neck) plus clavicles and toes;
+      // at rest the extra joints add up to exactly the old R15 layout, so exported Studio animations (which only know the 15 R15 parts) still play.
+      ['LowerTorso', null, [0, 0, 0], [0, 0, 0]],
+      ['UpperTorso', 'LowerTorso', [0, 0.2, 0], [0, -0.8, 0]],
+      ['Spine', 'UpperTorso', [0, -0.2, 0], [0, 0, 0]],
+      ['Chest', 'Spine', [0, 0.45, 0], [0, 0, 0]],
+      ['Neck', 'Chest', [0, 0.4, 0], [0, 0, 0]],
+      ['Head', 'Neck', [0, 0.15, 0], [0, -0.45, 0]],
+      ['RightClavicle', 'Chest', [0.25, 0.305, 0], [0, 0, 0]],
+      ['RightUpperArm', 'RightClavicle', [0.4, 0, 0], [0, 0.43, 0]],
+      ['RightLowerArm', 'RightUpperArm', [0, -0.43, 0], [0, 0.4, 0]],
+      ['RightHand', 'RightLowerArm', [0, -0.4, 0], [0, 0.23, 0]],
+      ['LeftClavicle', 'Chest', [-0.25, 0.305, 0], [0, 0, 0]],
+      ['LeftUpperArm', 'LeftClavicle', [-0.4, 0, 0], [0, 0.43, 0]],
+      ['LeftLowerArm', 'LeftUpperArm', [0, -0.43, 0], [0, 0.4, 0]],
+      ['LeftHand', 'LeftLowerArm', [0, -0.4, 0], [0, 0.23, 0]],
+      ['RightUpperLeg', 'LowerTorso', [0.32, -0.12, 0], [0, 0.54, 0]],
+      ['RightLowerLeg', 'RightUpperLeg', [0, -0.54, 0], [0, 0.6, 0]],
+      ['RightFoot', 'RightLowerLeg', [0, -0.6, 0], [0, 0.2, 0.19]],
+      ['RightToes', 'RightFoot', [0, -0.1, -0.12], [0, 0, 0]],
+      ['LeftUpperLeg', 'LowerTorso', [-0.32, -0.12, 0], [0, 0.54, 0]],
+      ['LeftLowerLeg', 'LeftUpperLeg', [0, -0.54, 0], [0, 0.6, 0]],
+      ['LeftFoot', 'LeftLowerLeg', [0, -0.6, 0], [0, 0.2, 0.19]],
+      ['LeftToes', 'LeftFoot', [0, -0.1, -0.12], [0, 0, 0]],
+    ];
+    const JOINTS = JOINT_DEFS.map(d => d[0]), PARENT = {}, C0 = {}, C1 = {}, C1i = {};
+    JOINT_DEFS.forEach(d => { PARENT[d[0]] = d[1]; C0[d[0]] = trans(d[2][0], d[2][1], d[2][2]); C1[d[0]] = trans(d[3][0], d[3][1], d[3][2]); C1i[d[0]] = inv(C1[d[0]]); });
+    const HIP_HEIGHT = 2.8;                              // studs: pelvis (LowerTorso centre) above the soles when standing
+    const LEG_T = 1.08, LEG_S = 1.2;                     // thigh / shin length
+
+    // ---- keyframe sampling (Roblox pose easing: applies to the move INTO the pose)
+    const ID = { p: [0, 0, 0], q: [0, 0, 0, 1] };
+    const bounceOut = a => { const n = 7.5625, d = 2.75; if (a < 1 / d) return n * a * a; if (a < 2 / d) { a -= 1.5 / d; return n * a * a + 0.75; } if (a < 2.5 / d) { a -= 2.25 / d; return n * a * a + 0.9375; } a -= 2.625 / d; return n * a * a + 0.984375; };
+    const elasticOut = a => (a <= 0 ? 0 : a >= 1 ? 1 : Math.pow(2, -10 * a) * Math.sin((a * 10 - 0.75) * (TAU / 3)) + 1);
+    const outFn = (style, a) => style === 'Cubic' ? 1 - Math.pow(1 - a, 3) : style === 'Bounce' ? bounceOut(a) : style === 'Elastic' ? elasticOut(a) : a;
+    const ease = (style, dir, a) => {
+      if (style === 'Constant') return a >= 1 ? 1 : 0;
+      if (style === 'Linear' || !style) return a;
+      if (dir === 'Out') return outFn(style, a);
+      if (dir === 'InOut') return a < 0.5 ? (1 - outFn(style, 1 - 2 * a)) / 2 : (1 + outFn(style, 2 * a - 1)) / 2;
+      return 1 - outFn(style, 1 - a);                    // In
+    };
+    function sample(tr, t) {
+      const n = tr.length;
+      if (t <= tr[0].t) return tr[0];
+      if (t >= tr[n - 1].t) return tr[n - 1];
+      let i = 0; while (i < n - 2 && t >= tr[i + 1].t) i++;
+      const a = tr[i], b = tr[i + 1], k = ease(b.e, b.d, (t - a.t) / Math.max(1e-6, b.t - a.t));
+      return { p: [lerp(a.p[0], b.p[0], k), lerp(a.p[1], b.p[1], k), lerp(a.p[2], b.p[2], k)], q: slerp(a.q, b.q, k) };
+    }
+
+    // ---- raw animation (the JSON the Studio exporter writes) -> playable animation
+    function compile(raw) {
+      const kfs = (raw.keyframes || []).slice().sort((a, b) => a.t - b.t);
+      if (!kfs.length) throw new Error('animation has no keyframes');
+      const length = Math.max(1e-3, raw.length || kfs[kfs.length - 1].t);
+      const tracks = {}, feet = [];
+      for (const kf of kfs) {
+        for (const jn in kf.poses || {}) {
+          if (JOINTS.indexOf(jn) < 0) continue;          // HumanoidRootPart, R6 names etc. carry no motion for this rig
+          const po = kf.poses[jn];
+          if (po.w === 0) continue;                      // weight 0 = pose is ignored
+          const r = po.r, m = [r[0], r[3], r[6], 0, r[1], r[4], r[7], 0, r[2], r[5], r[8], 0, 0, 0, 0, 1];
+          (tracks[jn] = tracks[jn] || []).push({ t: kf.t, p: po.p.slice(0, 3), q: qFromM(m), e: po.e || 'Linear', d: po.d || 'In' });
+        }
+        for (const mk of kf.markers || []) if (/foot|step/i.test(mk.n || '')) feet.push(kf.t / length);
+      }
+      if (!Object.keys(tracks).length) throw new Error('no R15 poses found (expected part names like LowerTorso, RightUpperLeg)');
+      const ft = raw.feet && raw.feet.length ? raw.feet : feet;
+      return { length, loop: raw.loop !== false, refSpeed: raw.refSpeed > 0 ? raw.refSpeed : 14.5, feet: ft.length ? ft : [0.25, 0.75], tracks };
+    }
+
+    // ---- final pose: blend the active animations per joint, run the Motor6D chain, return part matrices (stud units, root space)
+    const SPINE = { UpperTorso: 0.3, Spine: 0.3, Chest: 0.4 };   // share of torso lean / bank taken by each spine segment
+    function pose(list, look) {
+      const out = {};
+      for (const jn of JOINTS) {
+        let acc = null, accW = 0;
+        for (const it of list) {
+          const tr = it.a.tracks[jn], s = tr ? sample(tr, it.t) : ID;
+          if (!acc) { acc = { p: s.p.slice(), q: s.q.slice() }; accW = it.w; }
+          else { const f = it.w / (accW + it.w); acc.p = [lerp(acc.p[0], s.p[0], f), lerp(acc.p[1], s.p[1], f), lerp(acc.p[2], s.p[2], f)]; acc.q = slerp(acc.q, s.q, f); accW += it.w; }
+        }
+        if (!acc) acc = ID;
+        let T = mFromQP(acc.q, acc.p);
+        if (look) {
+          const sq = look.sq || 0;
+          if (SPINE[jn]) T = mul(T, mul(rotZ((look.bank || 0) * SPINE[jn]), rotX(-(look.lean || 0) * SPINE[jn])));   // lean into acceleration, bank into turns, shared along the spine
+          // neck + head: turn about Y, pitch about X (neck 40%, head 60%); together they counter-rotate the torso's lean/bank so the eyes stay level (gaze stabilisation)
+          else if (jn === 'Neck') T = mul(T, mul(rotZ(-(look.bank || 0) * 0.3), mul(rotX((look.lean || 0) * 0.25), mul(rotY(look.yaw * 0.4), rotX(look.pitch * 0.4)))));
+          else if (jn === 'Head') T = mul(T, mul(rotZ(-(look.bank || 0) * 0.3), mul(rotX((look.lean || 0) * 0.25), mul(rotY(look.yaw * 0.6), rotX(look.pitch * 0.6)))));
+          else if (sq > 0) {                                                          // landing: knees, hips and ankles absorb the impact, pelvis drops to match
+            if (jn.endsWith('UpperLeg')) T = mul(T, rotX(sq * 0.6));
+            else if (jn.endsWith('LowerLeg')) T = mul(T, rotX(-sq * 1.2));
+            else if (jn.endsWith('Foot')) T = mul(T, rotX(sq * 0.6));
+            else if (jn === 'LowerTorso') T = mul(trans(0, (LEG_T * Math.cos(sq * 0.6) + LEG_S * Math.cos(sq * 0.6 - sq * 1.2)) - (LEG_T + LEG_S), 0), T);
+          }
+        }
+        out[jn] = mul(PARENT[jn] ? out[PARENT[jn]] : trans(0, HIP_HEIGHT, 0), mul(mul(C0[jn], T), C1i[jn]));
+      }
+      return out;
+    }
+
+    // ---- built-in animations: authored as joint angles, baked into the same keyframe format as the Studio exporter.
+    // Angles are in the parent's axes: swing/hip +ve = forward, knee +ve = bend (shin goes back), elbow +ve = forearm forward,
+    // ankle +ve = toes up, lean/nod +ve = forward, twist/turn +ve = to the left, shz +ve = arm away from the body.
+    const toPose = M => ({ p: [M[12], M[13], M[14]], r: [M[0], M[4], M[8], M[1], M[5], M[9], M[2], M[6], M[10]], e: 'Linear', d: 'In', w: 1 });
+    function author(ch) {
+      const g = k => ch[k] || 0, a2 = (k, i) => (ch[k] && ch[k][i]) || 0, out = {};
+      out['LowerTorso'] = toPose(mul(trans(g('dx'), g('dy'), 0), mul(rotY(g('pyaw')), rotZ(g('proll')))));
+      const spineSeg = k => toPose(mul(rotY(g('twist') * k), mul(rotZ(g('roll') * k), rotX(-g('lean') * k))));
+      out['UpperTorso'] = spineSeg(0.3); out['Spine'] = spineSeg(0.3); out['Chest'] = spineSeg(0.4);   // abdomen / mid-spine / chest share the twist, roll and lean (the chest turns most)
+      out['Neck'] = toPose(mul(rotY(g('turn') * 0.4), rotX(-g('nod') * 0.4)));
+      out['Head'] = toPose(mul(rotY(g('turn') * 0.6), rotX(-g('nod') * 0.6)));
+      [['Right', 0, 1], ['Left', 1, -1]].forEach(a => {
+        const sd = a[0], i = a[1], sg = a[2];
+        out[sd + 'Clavicle'] = toPose(mul(rotZ(sg * a2('clu', i)), rotY(sg * a2('clp', i))));   // clu: shoulder shrug up, clp: shoulder pushed forward
+        out[sd + 'UpperArm'] = toPose(mul(rotX(a2('sh', i)), rotZ(sg * a2('shz', i))));
+        out[sd + 'LowerArm'] = toPose(mul(rotX(a2('el', i)), rotZ(sg * a2('elz', i))));   // elz: -ve = forearm angled back in toward the body
+        out[sd + 'Hand'] = toPose(rotX(a2('wr', i)));
+        out[sd + 'UpperLeg'] = toPose(mul(rotX(a2('hip', i)), rotZ(a2('hipz', i))));   // hipz: +ve = foot toward +X (world right) for both legs
+        out[sd + 'LowerLeg'] = toPose(rotX(-a2('knee', i)));
+        out[sd + 'Foot'] = toPose(rotX(a2('ank', i)));
+        out[sd + 'Toes'] = toPose(rotX(a2('toe', i)));                                   // toes: +ve = bend up (the ball of the foot rolls over them)
+      });
+      return out;
+    }
+    const bake = (length, loop, refSpeed, fn, N, feet) => {
+      const keyframes = [];
+      for (let i = 0; i <= N; i++) keyframes.push({ t: length * i / N, poses: author(fn(i / N)) });
+      return { length, loop, refSpeed, feet, keyframes };
+    };
+    const smooth = (x, a, b) => { const t = Math.min(1, Math.max(0, (x - a) / (b - a))); return t * t * (3 - 2 * t); };
+    // Two-step gait cycle in any of 8 directions: (df, dr) = forward / right components of the unit move direction.
+    // Right leg phase = f, left = f + 0.5. Stance covers the middle `st` of a leg's cycle; the swing leg flexes its knee to clear the ground,
+    // the planted foot is kept flat by the ankle, and the pelvis drops/rises so the planted leg always reaches the floor.
+    // ---- Gait model driven by normative human joint-angle data (Winter / Novacheck style curves).
+    // Tables are sampled every 10% of one leg's gait cycle, starting at heel strike, in radians (hip flexion +, knee flexion +).
+    // Foot pitch (toes up +) is authored per phase: heel strike -> foot flat -> heel rise -> toe-off. The ankle joint is then solved from
+    // hip, knee and that pitch, and the pelvis height from the planted leg INCLUDING the heel / ball-of-foot rocker, so feet stay on the floor.
+    const per = (tb, x) => {                              // periodic Catmull-Rom through the table
+      const n = tb.length; x = (((x % 1) + 1) % 1) * n; const i = Math.floor(x), t = x - i;
+      const p0 = tb[(i + n - 1) % n], p1 = tb[i % n], p2 = tb[(i + 1) % n], p3 = tb[(i + 2) % n];
+      return 0.5 * (2 * p1 + (-p0 + p2) * t + (2 * p0 - 5 * p1 + 4 * p2 - p3) * t * t + (-p0 + 3 * p1 - 3 * p2 + p3) * t * t * t);
+    };
+    const pw = (pts, x) => {                              // smooth piecewise curve through [x, y] points, clamped at both ends
+      if (x <= pts[0][0]) return pts[0][1];
+      for (let i = 1; i < pts.length; i++) if (x <= pts[i][0]) { const a = pts[i - 1], b = pts[i], t = (x - a[0]) / (b[0] - a[0]); return a[1] + (b[1] - a[1]) * t * t * (3 - 2 * t); }
+      return pts[pts.length - 1][1];
+    };
+    const avgT = t => t.reduce((a, b) => a + b, 0) / t.length;
+    const gait = (o, df, dr) => {
+      const st = o.st, u0 = 0.5 - st / 2, amp = 0.25 + 0.75 * Math.abs(df), sgn = df >= 0 ? 1 : -1, fs = 0.3 + 0.7 * Math.abs(df);
+      const hm = avgT(o.hip), hr = (Math.max(...o.hip) - Math.min(...o.hip)) / 2;
+      const pm = p => sgn > 0 ? p : ((st - p) % 1 + 1) % 1;                                   // moving backwards plays the forward cycle in reverse (toe-first contact, mirrored swing)
+      const hipAt = p => hm + (per(o.hip, pm(p)) - hm) * o.hA * Math.abs(df) + o.hS;
+      const kneeAt = p => o.kS + per(o.knee, pm(p)) * o.kA;
+      const footAt = p => pw(o.foot, pm(p)) * fs;
+      const ankAt = p => {                                 // stance: from the foot-pitch curve; swing: toe-off plantarflexion -> dorsiflexed clearance -> ready for heel strike
+        if (p < st) return footAt(p) + kneeAt(p) - hipAt(p);
+        const sS = (p - st) / (1 - st), a0 = footAt(st) + kneeAt(st) - hipAt(st), a1 = footAt(0) + kneeAt(0) - hipAt(0);
+        const v = pw([[0, a0], [0.3, o.sa[0]], [0.65, o.sa[1]], [0.85, o.sa[2]]], sS);
+        return v + (a1 - v) * smooth(sS, 0.8, 1);
+      };
+      const leg = (f, side) => {
+        const u = (f + 0.5 * side) % 1, p = ((u - u0) % 1 + 1) % 1, S = Math.sin(TAU * u);
+        const sw = p > 0.9 ? smooth(p, 0.97, 1) : 1 - smooth(p, st - 0.03, st + 0.03);       // 1 while this foot is planted
+        const hip = hipAt(p), knee = kneeAt(p), ank = ankAt(p), hipz = o.Az * dr * S + (side ? -o.lout : o.lout);
+        const ph = ank + hip - knee;                                                           // foot pitch relative to the ground
+        const rock = 0.36 * (Math.cos(ph) - 1) + (ph >= 0 ? 0.17 * Math.sin(ph) : 0.31 * Math.sin(-ph));   // ankle rise when rolling on the heel / on the toe joint (the toes bend to stay flat)
+        const H = (LEG_T * Math.cos(hip) + LEG_S * Math.cos(hip - knee)) * Math.cos(hipz) - (LEG_T + LEG_S) + rock;
+        const toe = p < st ? Math.max(0, -footAt(p)) : Math.max(0, -footAt(st)) * (1 - smooth((p - st) / (1 - st), 0, 0.45));   // toes stay on the floor while the heel lifts, then relax
+        return { hip, hipz, knee, ank, sw, H, toe };
+      };
+      const dyOf = f => { const R = leg(f, 0), L = leg(f, 1); return (R.sw * R.H + L.sw * L.H) / Math.max(R.sw + L.sw, 0.5); };
+      let dyMean = 0; for (let i = 0; i < 24; i++) dyMean += dyOf(i / 24) / 24;       // damping only shrinks the up/down bounce around this mean, so the feet still reach the floor
+      return f => {
+      const s = Math.sin(TAU * f), c = Math.cos(TAU * f), R = leg(f, 0), L = leg(f, 1), dy = dyMean + (dyOf(f) - dyMean) * o.bs;
+      // arms: each swings with the OPPOSITE leg's hip curve (normalised), elbows lag the shoulder
+      const pR = ((f - u0) % 1 + 1) % 1, pL = ((f + 0.5 - u0) % 1 + 1) % 1, hn = p => (per(o.hip, pm(p)) - hm) / hr, lag = o.elag / TAU * sgn;
+      const aR = hn(pL), aL = hn(pR), eR = hn(pL - lag), eL = hn(pR - lag);
+      const ga = x => x > 0 ? x * (1 - o.asym) : x * (1 + o.asym);
+      const tw = o.tw * amp * sgn * s, lean = o.lean * (df > 0 ? df : df * 0.3);
+      return {
+        dx: -o.sway * c * (1 + 0.5 * Math.abs(dr)), dy,
+        pyaw: 0.5 * tw, proll: -o.pt * c, lean, twist: -tw, roll: o.roll * c, nod: -lean * 0.85, turn: tw * 0.45,
+        sh: [o.aBase + o.aA * ga(amp * aR), o.aBase + o.aA * ga(amp * aL)],
+        shz: [o.out + o.outA * (0.5 - 0.5 * aR), o.out + o.outA * (0.5 - 0.5 * aL)],              // elbows kick out on the back swing
+        el: [o.eBase + o.eK * (0.5 + 0.5 * eR), o.eBase + o.eK * (0.5 + 0.5 * eL)],
+        elz: [-o.elIn * (0.5 + 0.5 * aR), -o.elIn * (0.5 + 0.5 * aL)],
+        wr: [-o.wrA * aR, -o.wrA * aL],
+        clp: [o.cl * aR, o.cl * aL], clu: [o.cs * (0.5 + 0.5 * aR), o.cs * (0.5 + 0.5 * aL)],   // shoulder girdle pushes forward with the arm and lifts as it swings up
+        hip: [R.hip, L.hip], hipz: [R.hipz, L.hipz], knee: [R.knee, L.knee], ank: [R.ank, L.ank], toe: [R.toe, L.toe],
+      };
+      };
+    };
+    // ground distance one cycle covers = 2 steps, each step = how far the planted ankle slides back under the pelvis
+    const strideOf = (fn, o, flight) => {
+      const st = o.st || 0.5, a = fn(0.5 - st / 2), b = fn(0.5 + st / 2);
+      const F = c => LEG_T * Math.sin(c.hip[0]) + LEG_S * Math.sin(c.hip[0] - c.knee[0]), G = c => (LEG_T + LEG_S) * Math.sin(c.hipz[0]);
+      return 2 * flight * Math.hypot(F(a) - F(b), G(a) - G(b));
+    };
+    const DIRS = ['', 'FR', 'R', 'BR', 'B', 'BL', 'L', 'FL'];   // slot-name suffix per compass direction, clockwise from forward (45 degree steps)
+    const legH = (hip, knee) => (LEG_T * Math.cos(hip) + LEG_S * Math.cos(hip - knee)) - (LEG_T + LEG_S);
+    function defaults() {
+      // Normative tables (heel strike at 0, every 10% of the cycle): hip / knee flexion in radians.
+      const WH = [0.52, 0.43, 0.26, 0.09, -0.05, -0.17, -0.09, 0.21, 0.44, 0.54], WK = [0.09, 0.26, 0.21, 0.10, 0.12, 0.30, 0.70, 1.05, 0.85, 0.30];   // walking
+      const RH = [0.87, 0.60, 0.20, -0.17, -0.10, 0.25, 0.70, 0.95, 1.00, 0.96], RK = [0.50, 1.00, 0.80, 0.70, 1.20, 1.80, 2.15, 2.18, 1.70, 0.90];   // running (cited data: hip ~50 deg at strike, -10 deg after toe-off, ~55 deg late swing; knee peak ~125 deg mid-swing)
+      const walk = { hip: WH, knee: WK, hA: 1.2, hS: -0.07, kS: 0, kA: 1, st: 0.6, foot: [[0, 0.4], [0.07, 0], [0.38, 0], [0.5, -0.3], [0.6, -0.95]], sa: [-0.05, 0.05, 0.08], Az: 0.5,
+        bs: 0.6, cl: 0.08, cs: 0.03, pt: 0.07, lean: 0.04, aA: 0.32, aBase: 0.02, eBase: 0.3, eK: 0.25, asym: 0.1, elag: 0.6, outA: 0.02, elIn: 0.05, wrA: 0.12, sway: 0.07, tw: 0.12, roll: 0.02, out: 0.06, lout: 0.02 };
+      const run = { hip: RH, knee: RK, hA: 1.0, hS: 0, kS: 0, kA: 1, st: 0.3, foot: [[0, 0.1], [0.06, 0], [0.2, 0], [0.26, -0.4], [0.3, -0.9]], sa: [-0.1, 0.1, 0.15], Az: 0.7,
+        bs: 0.55, cl: 0.16, cs: 0.07, pt: 0.07, lean: 0.17, aA: 0.75, aBase: 0.0, eBase: 1.25, eK: 0.5, asym: 0.1, elag: 0.4, outA: 0.08, elIn: 0.25, wrA: 0.08, sway: 0.04, tw: 0.2, roll: 0.03, out: 0.08, lout: 0.025 };
+      const cw = { hip: WH, knee: WK, hA: 0.8, hS: 0.55, kS: 1.2, kA: 0.6, st: 0.62, foot: [[0, 0.1], [0.08, 0], [0.45, 0], [0.55, -0.2], [0.62, -0.45]], sa: [-0.05, 0.05, 0.05], Az: 0.4,
+        bs: 0.6, cl: 0.05, cs: 0.02, pt: 0.04, lean: 0.4, aA: 0.18, aBase: 0.45, eBase: 0.9, eK: 0.2, asym: 0, elag: 0.5, outA: 0.02, elIn: 0.05, wrA: 0.06, sway: 0.06, tw: 0.07, roll: 0.02, out: 0.1, lout: 0.05 };
+      const A = {}, gaits = { walk: [walk, 0.95], run: [run, 0.6], crouchWalk: [cw, 1.1] };
+      for (const gname in gaits) {
+        const o = gaits[gname][0], L = gaits[gname][1], fl = Math.max(1, 0.5 / o.st), u0 = 0.5 - o.st / 2;   // fl: a runner covers extra ground in flight between steps
+        DIRS.forEach((suf, i) => {
+          const a = i * Math.PI / 4, df = Math.round(Math.cos(a) * 1e6) / 1e6, dr = Math.round(Math.sin(a) * 1e6) / 1e6, fn = gait(o, df, dr);
+          A[gname + suf] = bake(L, true, strideOf(fn, o, fl) / L, fn, 48, [u0, u0 + 0.5]);
+        });
+      }
+      const CH = 1.0, CK = 2.0, cDy = legH(CH, CK);       // tactical crouch (about 57 deg hip / 115 deg knee): thigh and shin symmetric so the hips stay over the feet
+      // Idle matches the reference mannequin: arms hang a little away from the body with the forearms dropping back to vertical,
+      // weight on the left leg with the right foot eased back and slightly lifted, torso a touch turned, head level.
+      // ---- Keyframe authoring: each clip is a list of named key poses [time 0..1, channels]; a Catmull-Rom spline runs through them (smooth, no stop-start at each key),
+      // then the result is baked to dense Studio-style keyframes. Missing channels default to 0 so keys only list what changes. Breathing rides on top as its own cycle.
+      const ARRK = { sh: 1, shz: 1, el: 1, elz: 1, wr: 1, clu: 1, clp: 1, hip: 1, hipz: 1, knee: 1, ank: 1, toe: 1 };
+      const keyed = (keys, post) => {
+        const ks = keys.slice().sort((a, b) => a[0] - b[0]), N = ks.length, names = {};
+        ks.forEach(k => { for (const n in k[1]) names[n] = 1; });
+        const md = j => ((j % N) + N) % N, T = j => ks[md(j)][0] + Math.floor(j / N);
+        const val = (j, n, i) => { const v = ks[md(j)][1][n]; return ARRK[n] ? (v ? v[i] || 0 : 0) : (v || 0); };
+        const hermite = (n, i, j, u, dt) => {
+          const v0 = val(j, n, i), v1 = val(j + 1, n, i), m0 = (val(j + 1, n, i) - val(j - 1, n, i)) / (T(j + 1) - T(j - 1)), m1 = (val(j + 2, n, i) - val(j, n, i)) / (T(j + 2) - T(j));
+          const u2 = u * u, u3 = u2 * u;
+          return (2 * u3 - 3 * u2 + 1) * v0 + (u3 - 2 * u2 + u) * dt * m0 + (-2 * u3 + 3 * u2) * v1 + (u3 - u2) * dt * m1;
+        };
+        return f => {
+          f = ((f % 1) + 1) % 1;
+          let j = N - 1; for (let k = 0; k < N; k++) if (ks[k][0] > f) { j = k - 1; break; }
+          if (j < 0) j = N - 1 - N;                                           // before the first key: the previous segment wraps around
+          const t0 = T(j), t1 = T(j + 1), u = (f - t0) / (t1 - t0), dt = t1 - t0, o = {};
+          for (const n in names) o[n] = ARRK[n] ? [hermite(n, 0, j, u, dt), hermite(n, 1, j, u, dt)] : hermite(n, 0, j, u, dt);
+          return post ? post(o, f) : o;
+        };
+      };
+      const add2 = (o, n, a, b) => { o[n] = [(o[n] ? o[n][0] : 0) + a, (o[n] ? o[n][1] : 0) + (b === undefined ? a : b)]; };
+      // Breathing (about 3 breaths per 12 s loop, ie. 15/min): chest and shoulders lift on the inhale, the head nods a hair, the ribcage widens the arms.
+      const breathe = (cycles, k) => (o, f) => {
+        const b = Math.sin(TAU * cycles * f - 1.2); o.lean = (o.lean || 0) + 0.01 * k * b; o.nod = (o.nod || 0) - 0.006 * k * b; o.dy = (o.dy || 0) + 0.004 * k * b;
+        add2(o, 'clu', 0.02 * k * b); add2(o, 'shz', 0.025 * k * b); return o;
+      };
+      const rest = { hip: [-0.05, 0.06], hipz: [0.03, -0.03], knee: [0.1, 0.06], ank: [0.05, -0.02], sh: [0.05, 0.03], shz: [0.22, 0.22], el: [0.18, 0.2], elz: [-0.2, -0.2], twist: 0.04, lean: 0.03, dy: -0.007 };
+      const Pz = (base, o) => Object.assign({}, base, o);
+      // Pose vocabulary for standing: weight on the right / left leg (hips shift over the loaded leg, its knee locks, the other knee relaxes, free foot eased out).
+      const wR = { dx: 0.05, proll: 0.03, hip: [-0.04, 0.12], hipz: [0.02, -0.06], knee: [0.04, 0.22], ank: [0.03, -0.04], twist: 0.07, roll: -0.02, dy: -0.004 };
+      const wL = { dx: -0.05, proll: -0.03, hip: [0.12, -0.04], hipz: [0.06, -0.02], knee: [0.22, 0.04], ank: [-0.04, 0.03], twist: 0.01, roll: 0.02, dy: -0.004 };
+      // Idle: 12 s of quiet standing (sources: quiet-stance sway is slow and small, people shift weight every few seconds and scan their surroundings with head turns that lead the body).
+      A.idle = bake(12, true, 14.5, keyed([
+        [0.00, Pz(rest, {})],
+        [0.08, Pz(rest, wR)],                                                                    // settle onto the right leg
+        [0.17, Pz(rest, Object.assign({}, wR, { turn: -0.45, twist: 0.0, nod: 0.03, clp: [0.03, -0.03] }))],   // glance right: head leads, shoulders follow a little
+        [0.27, Pz(rest, Object.assign({}, wR, { turn: -0.1, sh: [0.2, 0.03], el: [0.55, 0.2], wr: [0.15, 0], dx: 0.035 }))],   // right hand drifts up to adjust
+        [0.40, Pz(rest, { nod: -0.02, sh: [0.06, 0.04] })],                                      // back to neutral
+        [0.50, Pz(rest, wL)],                                                                    // weight to the left leg
+        [0.60, Pz(rest, Object.assign({}, wL, { turn: 0.4, twist: 0.08, clu: [0.12, 0.12], nod: 0.02 }))],   // glance left with a small shoulder lift
+        [0.75, Pz(rest, { lean: 0.06, nod: 0.05, sh: [0.1, 0.1], el: [0.22, 0.25], dy: -0.011 })],   // relax: slight slouch, head dips
+        [0.90, Pz(rest, { lean: 0.02, clp: [0.1, 0.1], clu: [0.06, 0.06], sh: [0.04, 0.06], twist: 0.02 })],   // roll the shoulders back
+      ], breathe(3, 1)), 96);
+      // Crouch idle: 8 s of a held low stance scanning left and right, weight sinking and recovering, steady breathing.
+      const cBase = { dy: cDy, lean: 0.45, nod: -0.38, sh: [0.45, 0.5], shz: [0.15, 0.15], clu: [0.03, 0.03], clp: [0.1, 0.1], el: [1.0, 1.1], hip: [CH, CH - 0.04], hipz: [0.12, -0.12], knee: [CK, CK - 0.05], ank: [CH, CH - 0.04] };
+      A.crouchIdle = bake(8, true, 14.5, keyed([
+        [0.00, Pz(cBase, {})],
+        [0.15, Pz(cBase, { turn: 0.55, twist: 0.12, dy: cDy - 0.01 })],                          // scan left
+        [0.30, Pz(cBase, { turn: 0.2, twist: 0.04 })],
+        [0.50, Pz(cBase, { dy: cDy - 0.025, lean: 0.5, nod: -0.43 })],                           // sink a little lower, hold
+        [0.65, Pz(cBase, { turn: -0.55, twist: -0.12, dy: cDy - 0.01 })],                        // scan right
+        [0.82, Pz(cBase, { turn: -0.15, twist: -0.03, dy: cDy + 0.005 })],
+      ], breathe(2, 1.3)), 64);
+      // Fall: arms out and up for balance, one leg slightly ahead, loose corrections over 1.6 s.
+      const fBase = { lean: 0.04, nod: -0.06, sh: [0.5, 0.45], shz: [0.95, 0.95], clu: [0.2, 0.2], el: [0.3, 0.35], hip: [0.3, -0.02], hipz: [0.1, -0.1], knee: [0.4, 0.3], ank: [-0.12, 0] };
+      A.fall = bake(1.6, true, 14.5, keyed([
+        [0.00, Pz(fBase, {})],
+        [0.25, Pz(fBase, { sh: [0.62, 0.38], shz: [1.02, 0.88], hip: [0.34, 0.02], knee: [0.46, 0.3], twist: 0.04, roll: 0.02 })],
+        [0.50, Pz(fBase, { sh: [0.5, 0.55], shz: [0.9, 1.0], hip: [0.28, -0.05], knee: [0.38, 0.36], ank: [-0.15, 0.02], lean: 0.05 })],
+        [0.75, Pz(fBase, { sh: [0.38, 0.62], shz: [0.88, 1.02], hip: [0.3, 0.0], knee: [0.34, 0.28], twist: -0.04, roll: -0.02 })],
+      ], null), 32);
+      // Jump (non-looping, 0.7 s from the instant the feet leave the ground). Timing follows countermovement-jump data: arms are already swinging up as the legs finish
+      // pushing off (the arm swing starts ~76% of the way through the jump), the ankles reach ~40 deg plantarflexion at take-off, the body tucks gently at the apex
+      // and the legs reach down with toes up before touchdown. Each key carries its own easing, so the Studio exporter format is used as-is.
+      const jp = (ch, e, d) => { const po = author(ch); for (const k in po) { po[k].e = e; po[k].d = d; } return po; };
+      A.jump = { length: 0.7, loop: false, refSpeed: 14.5, keyframes: [
+        { t: 0,    poses: jp({ lean: 0.12, nod: -0.08, sh: [1.0, 1.0], shz: [0.3, 0.3], el: [0.3, 0.3], hip: [-0.05, -0.02], knee: [0.05, 0.08], ank: [-0.75, -0.7], toe: [0.6, 0.55], clu: [0.15, 0.15], hipz: [0.04, -0.04] }, 'Linear', 'In') },   // end of push-off: triple extension, arms rising
+        { t: 0.08, poses: jp({ lean: 0.06, nod: -0.07, sh: [1.5, 1.5], shz: [0.4, 0.4], el: [0.25, 0.25], hip: [0.15, 0.12], knee: [0.3, 0.3], ank: [-0.6, -0.55], toe: [0.2, 0.2], clu: [0.25, 0.25], clp: [0.1, 0.1], hipz: [0.05, -0.05] }, 'Cubic', 'Out') },   // toes leave the ground, hips start to flex
+        { t: 0.22, poses: jp({ lean: 0.02, nod: -0.06, sh: [1.9, 1.9], shz: [0.5, 0.5], el: [0.2, 0.2], hip: [0.4, 0.3], knee: [0.7, 0.6], ank: [-0.3, -0.3], clu: [0.3, 0.3], clp: [0.1, 0.1], hipz: [0.06, -0.06] }, 'Cubic', 'Out') },   // ascent: arms overhead, knees come up
+        { t: 0.35, poses: jp({ lean: 0.04, nod: -0.05, sh: [1.3, 1.3], shz: [0.8, 0.8], el: [0.3, 0.3], hip: [0.5, 0.4], knee: [0.85, 0.75], ank: [-0.15, -0.2], clu: [0.25, 0.25], hipz: [0.08, -0.08] }, 'Cubic', 'InOut') },   // apex: gentle tuck, arms start to open
+        { t: 0.5,  poses: jp({ lean: 0.05, nod: -0.04, sh: [0.8, 0.8], shz: [0.9, 0.9], el: [0.35, 0.35], hip: [0.35, 0.25], knee: [0.55, 0.5], ank: [0.0, 0.05], clu: [0.15, 0.15], hipz: [0.09, -0.09] }, 'Cubic', 'InOut') },   // descent: legs extend to meet the ground
+        { t: 0.7,  poses: jp({ lean: 0.08, nod: -0.02, sh: [0.5, 0.5], shz: [0.7, 0.7], el: [0.35, 0.35], hip: [0.3, 0.2], knee: [0.35, 0.3], ank: [0.15, 0.1], clu: [0.08, 0.08], hipz: [0.09, -0.09] }, 'Cubic', 'Out') }] };   // ready to land: toes up, arms low and wide
+      return A;
+    }
+    return { compile, pose, defaults, author, JOINTS, C0, C1, DIRS, HIP_HEIGHT };
+  })();
+  // RA-END
+
+  // ---- Playback: slots (idle / walk / run / jump / fall / crouchIdle / crouchWalk) -> weighted layers -> R15 pose -> rig parts
+  const ANIMS = {}, layers = {}, savedAnims = {};
+  // 8-way locomotion: each gait (walk / run / crouchWalk) has a clip per compass direction. "walk" is forward; the others are
+  // walkFR, walkR, walkBR, walkB, walkBL, walkL, walkFL (same suffixes for run and crouchWalk).
+  const GAITS = ['walk', 'run', 'crouchWalk'], GAIT_FB = { run: 'walk', crouchWalk: 'walk' }, DIRS = RA.DIRS;
+  const LOCO = {}, SLOT_NAMES = ['idle', 'jump', 'fall', 'crouchIdle'];
+  GAITS.forEach(g => DIRS.forEach(d => { LOCO[g + d] = 1; SLOT_NAMES.push(g + d); }));
+  const FALLBACK = { crouchIdle: 'idle', jump: 'fall', fall: 'idle' };
+  function setAnim(slotName, raw) { const a = RA.compile(raw); a.loco = !!LOCO[slotName]; ANIMS[slotName] = a; }
+  function loadDefaults() { const D = RA.defaults(); for (const k in D) setAnim(k, D[k]); for (const n in layers) delete layers[n]; }
+  loadDefaults();
+  const resolveSlot = n => { for (let i = 0; i < 5 && !ANIMS[n]; i++) n = FALLBACK[n] || 'idle'; return n; };
+  // Clip(s) for gait g in compass direction i. Missing diagonals blend their two neighbouring cardinals; a missing cardinal falls
+  // back to the gait's forward clip (backwards = the forward clip played in reverse); run / crouchWalk fall back to walk.
+  function dirClip(g, i, w, out) {
+    for (let gg = g; gg; gg = GAIT_FB[gg]) { const n = gg + DIRS[i]; if (ANIMS[n]) { out(n, false, w); return; } }
+    if (i & 1) { dirClip(g, (i + 7) % 8, w / 2, out); dirClip(g, (i + 1) % 8, w / 2, out); return; }
+    for (let gg = g; gg; gg = GAIT_FB[gg]) if (ANIMS[gg]) { out(gg, i === 4, w); return; }
+    out('idle', false, w);
+  }
+  function animNote(msg) { animMsg = msg; animMsgAt = performance.now(); console.log('[anim] ' + msg); }
+  // Import: {"animations": {"walk": {...}, "idle": {...}}} written by the Studio exporter, or a single {"slot": "walk", ...animation}
+  function importAnims(text) {
+    const data = JSON.parse(text);
+    if (data.reset) { for (const k in savedAnims) delete savedAnims[k]; try { localStorage.removeItem('r6anims'); } catch (e) {} loadDefaults(); animNote('built-in animations restored'); return; }
+    const set = data.animations || (data.keyframes ? { [data.slot || data.name || 'idle']: data } : null);
+    if (!set) throw new Error('no "animations" object found in that file');
+    const done = [], unused = [];
+    for (const k in set) { setAnim(k, set[k]); savedAnims[k] = set[k]; (SLOT_NAMES.indexOf(k) >= 0 ? done : unused).push(k); }
+    try { localStorage.setItem('r6anims', JSON.stringify(savedAnims)); } catch (e) {}
+    animNote('loaded: ' + (done.join(', ') || 'nothing') + (unused.length ? '  (ignored unknown slots: ' + unused.join(', ') + ')' : ''));
+  }
+  try { const s = localStorage.getItem('r6anims'); if (s) { const d = JSON.parse(s); for (const k in d) { setAnim(k, d[k]); savedAnims[k] = d[k]; } } } catch (e) { console.warn('saved animations ignored', e); }
+  addEventListener('dragover', e => e.preventDefault());
+  addEventListener('drop', e => {
+    e.preventDefault();
+    const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+    if (f) f.text().then(importAnims).catch(err => animNote('import failed: ' + (err && err.message || err)));
+  });
+  let locoPhase = 0, dirF = 1, dirR = 0, lastFoot = { a: null, n: [] };
+  let bLean = 0, bBank = 0;                           // procedural body lean (accel/brake) and bank (turning), smoothed
+  const sm01 = x => { x = cl(x, 0, 1); return x * x * (3 - 2 * x); };
+  // Character facing is supplied from the weapon heading, independently of camera follow-through.
+  function updateRig(fdt, fx, fy, fz, facing) {
+    const rigFacing = facing;
+    const S = R.S, spd = Math.hypot(vx, vz), studs = spd / S;
+    const mv = grounded ? sm01((spd - 0.08) / 0.37) : 0;                      // how "moving" we are
+    const want = {};                                                           // layer key -> target weight; key = clip name, '~' suffix = played in reverse
+    const addKey = (n, rev, w) => { if (w > 0.0005) { const k = n + (rev ? '~' : ''); want[k] = (want[k] || 0) + w; } };
+    const add = (s, w) => addKey(resolveSlot(s), false, w);
+    // move direction relative to the body (torso yaw), smoothed so the 8-way blend glides instead of popping
+    if (spd > 0.3) {
+      const vf = -(vx * Math.sin(rigFacing) + vz * Math.cos(rigFacing)) / spd, vr = (vx * Math.cos(rigFacing) - vz * Math.sin(rigFacing)) / spd, dk = 1 - Math.exp(-12 * fdt);
+      dirF += (vf - dirF) * dk; dirR += (vr - dirR) * dk;
+      const dn = Math.hypot(dirF, dirR) || 1; dirF /= dn; dirR /= dn;
+    }
+    const u = ((Math.atan2(dirR, dirF) / (Math.PI / 4)) % 8 + 8) % 8, i0 = Math.floor(u), fr = u - i0;
+    const gaitW = (gait, w) => { if (w > 0.0005) { dirClip(gait, i0 % 8, w * (1 - fr), addKey); dirClip(gait, (i0 + 1) % 8, w * fr, addKey); } };
+    if (!grounded) add(vy > 0.3 ? 'jump' : 'fall', 1);
+    else if (crouched) { add('crouchIdle', 1 - mv); gaitW('crouchWalk', mv); }
+    else { const r = sm01((spd - WALK * 1.25) / (SPRINT * 0.8 - WALK * 1.25)); add('idle', 1 - mv); gaitW('walk', mv * (1 - r)); gaitW('run', mv * r); }
+    // crossfade: layers ease toward their target weight (~0.1 s), one-shots restart when they start fading in
+    const fk = 1 - Math.exp(-10 * fdt);
+    for (const k in want) if (!layers[k]) layers[k] = { w: 0, t: 0, n: k.replace('~', ''), rev: k.slice(-1) === '~' };
+    for (const n in layers) {
+      const L = layers[n], a = ANIMS[L.n], tw = want[n] || 0;
+      if (!a) { delete layers[n]; continue; }
+      if (!a.loop && tw > 0 && L.w < 0.05) L.t = 0;
+      L.w += (tw - L.w) * fk;
+      if (tw === 0 && L.w < 0.002) { delete layers[n]; continue; }
+      if (!a.loco) L.t += fdt;
+    }
+    // locomotion cycles share one phase so walk <-> run blends stay in step; the rate follows real ground speed (studs/s vs the animation's refSpeed)
+    let num = 0, den = 0, dom = null, domW = 0;
+    for (const n in layers) { const L = layers[n], a = ANIMS[L.n]; if (a.loco) { num += L.w * studs / (a.refSpeed * a.length); den += L.w; if (L.w > domW) { domW = L.w; dom = a; } } }
+    const cps = den > 0 ? cl(den, 0, 1) * 0.5 / (sprinting ? STEP_INTERVAL_SPRINT : STEP_INTERVAL_WALK) : 0;   // 1 cycle = 2 steps, fixed step interval
+    locoPhase += cps * fdt;
+    animStepRate = 2 * cps;
+    if (dom) {                                                                 // footstep sound / camera jolt at the animation's foot-plant phases
+      if (lastFoot.a !== dom) { lastFoot.a = dom; lastFoot.n = dom.feet.map(p => Math.floor(locoPhase - p)); }
+      else dom.feet.forEach((p, i) => { const n = Math.floor(locoPhase - p); if (n !== lastFoot.n[i]) { lastFoot.n[i] = n; } });
+    }
+    const list = [], ph = locoPhase - Math.floor(locoPhase);
+    let info = '';
+    for (const n in layers) {
+      const L = layers[n], a = ANIMS[L.n];
+      if (L.w < 0.002) continue;
+      list.push({ a, t: a.loco ? (L.rev ? (1 - ph) % 1 : ph) * a.length : (a.loop ? L.t % a.length : Math.min(L.t, a.length)), w: L.w });
+      info += n + ' ' + L.w.toFixed(2) + '  ';
+    }
+    animInfo = info;
+    const bk = Math.min(1, fdt * 8), moveG = grounded ? Math.min(1, spd / 3) : 0;
+    bLean += (cl(aSm * 0.015, -0.12, 0.2) * moveG - bLean) * bk;                           // lean forward when speeding up, rock back when braking
+    bBank += (cl(yrS * 0.012, -0.14, 0.14) * moveG - bBank) * bk;                          // bank into fast turns, scaled by speed
+    const M = RA.pose(list, { yaw: cl(yaw - rigFacing, -1, 1), pitch: cl(pitch * 0.8, -1, 1), lean: bLean, bank: bBank, sq: cl(-landY * 2.2, 0, 0.85) });
+    for (const jn in M) { const g = R.P[jn]; g.matrix.fromArray(M[jn]); g.matrixWorldNeedsUpdate = true; }
+    R.root.position.set(fx, fy, fz);
+    R.root.rotation.y = rigFacing;                    // body rotates directly with the weapon heading
+    R.root.scale.setScalar(S);
+  }
+
+  // ---------------------------------------------------------------- MOVEMENT STATE & TUNING
+  // =====================================================================================================
+  // BODY EDITOR (press B): pick a part, resize it with sliders, move / rotate it. Saved in this browser (localStorage).
+  // =====================================================================================================
+  (function bodyEditor() {
+    const STORE = 'bodyEditor.v3', OLD_STORE = 'bodyEditor.v2';   // v3: chest / neck / upper belly / foot are positioned relative to the new spine, neck and toe joints
+    const J0 = { shoulderX: 0.65, shoulderY: 0.555, hipX: 0.32 };
+    const JC = Object.assign({}, J0);
+    const T = (x, y, z) => [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, x, y, z, 1];
+    function applyJoints() {
+      RA.C0.RightUpperArm = T(JC.shoulderX - 0.25, JC.shoulderY - 0.555, 0); RA.C0.LeftUpperArm = T(-(JC.shoulderX - 0.25), JC.shoulderY - 0.555, 0);   // relative to the clavicle joint
+      RA.C0.RightUpperLeg = T(JC.hipX, -0.12, 0);             RA.C0.LeftUpperLeg = T(-JC.hipX, -0.12, 0);
+    }
+    const RANGE = { h: [0.05, 2.5], r: [0.03, 0.7], w: [0.05, 2], d: [0.05, 1.5], c: [0.03, 0.5], sx: [0, 0.5], x: [-1, 1], y: [-1.5, 1.5], z: [-1, 1], rx: [-180, 180], ry: [-180, 180], rz: [-180, 180],
+                    shoulderX: [0.2, 1.2], shoulderY: [0.2, 1.2], hipX: [0.1, 0.7] };
+    const LABEL = { h: 'Height', r: 'Radius', w: 'Width', d: 'Depth', c: 'Roundness', sx: 'Eye spacing', x: 'Move sideways', y: 'Move up / down', z: 'Move front / back', rx: 'Tilt forward', ry: 'Turn', rz: 'Tilt sideways',
+                    shoulderX: 'Shoulder width', shoulderY: 'Shoulder height', hipX: 'Hip width' };
+    const SIZE = { pill: ['h', 'r'], rbox: ['w', 'h', 'd', 'c'], box: ['w', 'h', 'd'], sphere: ['r'], eyes: ['r', 'sx'] };
+
+    const panel = document.createElement('div'); panel.id = 'bodyEd';
+    panel.innerHTML = '<div class="be-head"><b>Body editor</b><button id="be-close">Close (B)</button></div>' +
+      '<div class="be-hint">Click a body part or choose one below. Drag = rotate view, scroll = zoom. Left and right limbs change together. Changes save automatically.</div>' +
+      '<div class="be-cam"><button data-cam="2">Front view</button><button data-cam="1">Back view</button></div>' +
+      '<select id="be-part"></select><div id="be-sliders"></div>' +
+      '<div class="be-btns"><button id="be-reset">Reset this part</button><button id="be-resetall">Reset everything</button></div>' +
+      '<details><summary>Export / import settings</summary><textarea id="be-json" spellcheck="false"></textarea>' +
+      '<div class="be-btns"><button id="be-copy">Copy</button><button id="be-apply">Apply pasted</button></div></details>';
+    document.body.appendChild(panel);
+    for (const t of ['keydown', 'keyup']) panel.addEventListener(t, e => e.stopPropagation());   // typing in the panel must not move the player
+    const $ = id => panel.querySelector(id), selEl = $('#be-part'), host = $('#be-sliders'), jsonEl = $('#be-json');
+    for (const k in R.PART_DEFS) selEl.add(new Option(R.PART_DEFS[k].label, k));
+    selEl.add(new Option('Joints: shoulder / hip width', 'joints'));
+    let sel = 'chest';
+
+    function save() {
+      try { localStorage.setItem(STORE, JSON.stringify({ parts: R.CFG, joints: JC })); } catch (e) {}
+      syncNpc();
+      jsonEl.value = JSON.stringify({ parts: R.CFG, joints: JC }, null, 1);
+    }
+    function load(obj) {
+      if (!obj || typeof obj !== 'object') return;
+      for (const k in (obj.parts || {})) if (R.CFG[k]) for (const p in obj.parts[k]) if (p in R.CFG[k] && Number.isFinite(obj.parts[k][p])) R.CFG[k][p] = obj.parts[k][p];
+      for (const p in (obj.joints || {})) if (p in JC && Number.isFinite(obj.joints[p])) JC[p] = obj.joints[p];
+      R.applyAll(); applyJoints();
+    }
+    function row(label, p, get, set) {
+      const [lo, hi] = RANGE[p], rot = /^r[xyz]$/.test(p);
+      const div = document.createElement('div'); div.className = 'be-row';
+      div.innerHTML = '<label>' + label + '</label><input type="range"><input type="number">';
+      const [rg, nm] = div.querySelectorAll('input');
+      rg.min = lo; rg.max = hi; rg.step = rot ? 1 : 0.005; nm.step = rot ? 1 : 0.01;
+      const show = v => { rg.value = v; nm.value = rot ? Math.round(v) : (+v).toFixed(3); };
+      show(get());
+      rg.oninput = () => { const v = parseFloat(rg.value); set(v); nm.value = rot ? Math.round(v) : v.toFixed(3); };
+      nm.oninput = () => { const v = parseFloat(nm.value); if (Number.isFinite(v)) { set(v); rg.value = v; } };
+      host.appendChild(div);
+    }
+    function section(t) { const d = document.createElement('div'); d.className = 'be-sec'; d.textContent = t; host.appendChild(d); }
+    function build() {
+      host.innerHTML = '';
+      if (sel === 'joints') {
+        section('Joint positions');
+        for (const p of ['shoulderX', 'shoulderY', 'hipX']) row(LABEL[p], p, () => JC[p], v => { JC[p] = v; applyJoints(); save(); });
+        return;
+      }
+      const d = R.PART_DEFS[sel], c = R.CFG[sel];
+      section('Size');
+      for (const p of SIZE[d.kind]) row(LABEL[p], p, () => c[p], v => { c[p] = v; R.applyPart(sel); save(); });
+      section('Move' + (d.kind === 'eyes' ? '' : ' / rotate'));
+      for (const p of (d.kind === 'eyes' ? ['y', 'z'] : ['x', 'y', 'z', 'rx', 'ry', 'rz'])) row(LABEL[p], p, () => c[p], v => { c[p] = v; R.applyPart(sel); save(); });
+    }
+    function choose(k) { sel = k; selEl.value = k; R.setSelected(k === 'joints' ? null : k); build(); }
+    selEl.onchange = () => choose(selEl.value);
+    $('#be-reset').onclick = () => {
+      if (sel === 'joints') { Object.assign(JC, J0); applyJoints(); }
+      else { Object.assign(R.CFG[sel], R.DEFCFG[sel]); R.applyPart(sel); }
+      save(); build();
+    };
+    $('#be-resetall').onclick = () => {
+      for (const k in R.CFG) Object.assign(R.CFG[k], R.DEFCFG[k]);
+      Object.assign(JC, J0); R.applyAll(); applyJoints(); save(); build();
+    };
+    $('#be-copy').onclick = () => { jsonEl.select(); try { navigator.clipboard.writeText(jsonEl.value); } catch (e) { document.execCommand('copy'); } };
+    $('#be-apply').onclick = () => { try { load(JSON.parse(jsonEl.value)); save(); build(); } catch (e) { alert('Could not read that text as settings.'); } };
+    panel.querySelectorAll('[data-cam]').forEach(b => b.onclick = () => { camMode = +b.dataset.cam; thirdPerson = true; applyRigView(); });
+
+    function setOpen(on) {
+      editorOpen = on; panel.style.display = on ? 'block' : 'none';
+      if (on) {
+        if (document.pointerLockElement) document.exitPointerLock();
+        overlay.style.display = 'none';
+        if (camMode === 0) { camMode = 2; thirdPerson = true; applyRigView(); }
+        choose(sel);
+      } else { R.setSelected(null); if (!locked) overlay.style.display = 'flex'; }
+    }
+    $('#be-close').onclick = () => setOpen(false);
+    addEventListener('keydown', e => { if (e.code === 'KeyB' && !e.repeat) setOpen(!editorOpen); });
+
+    // mouse on the 3D view while the editor is open: drag = orbit, scroll = zoom, click = pick a part
+    const cv = renderer.domElement, ray = new THREE.Raycaster(), v2 = new THREE.Vector2();
+    let drag = null;
+    cv.addEventListener('pointerdown', e => { if (!editorOpen || locked) return; drag = { x: e.clientX, y: e.clientY, moved: 0 }; try { cv.setPointerCapture(e.pointerId); } catch (err) {} });
+    cv.addEventListener('pointermove', e => {
+      if (!drag) return;
+      const dx = e.clientX - drag.x, dy = e.clientY - drag.y; drag.x = e.clientX; drag.y = e.clientY; drag.moved += Math.abs(dx) + Math.abs(dy);
+      yawT -= dx * SENS * 1.6; pitchT = Math.max(-1.55, Math.min(1.55, pitchT - dy * SENS * 1.6)); yaw = yawT; pitch = pitchT;
+    });
+    cv.addEventListener('pointerup', e => {
+      if (!drag) return;
+      const click = drag.moved < 5; drag = null;
+      if (!click) return;
+      const r = cv.getBoundingClientRect(); v2.set(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1);
+      ray.setFromCamera(v2, camera);
+      for (const h of ray.intersectObject(R.root, true)) { const k = h.object.userData.part; if (k) { choose(k); break; } }
+    });
+    cv.addEventListener('wheel', e => { if (!editorOpen) return; e.preventDefault(); tpZoom = Math.max(0.25, Math.min(2.5, tpZoom * Math.exp(e.deltaY * 0.001))); }, { passive: false });
+
+    try {
+      let saved = JSON.parse(localStorage.getItem(STORE) || 'null');
+      if (!saved) {                                    // migrate settings saved against the old single-block torso: keep the user's sizes, move the offsets to the new joints
+        const o = JSON.parse(localStorage.getItem(OLD_STORE) || 'null'), pp = o && o.parts;
+        if (pp) {
+          if (pp.chest && Number.isFinite(pp.chest.y)) pp.chest.y -= 0.25;
+          if (pp.neck && Number.isFinite(pp.neck.y)) pp.neck.y -= 0.65;
+          if (pp.belly1 && Number.isFinite(pp.belly1.y)) pp.belly1.y += 0.2;
+          if (pp.foot) { delete pp.foot.d; delete pp.foot.z; }          // the foot is now shorter; the toes are a separate part
+          saved = o;
+        }
+      }
+      load(saved);
+    } catch (e) {}
+    save();
+  })();
+
+  const MOVE_SCALE = 0.8;                            // scales all movement speeds (1 = original). The body is 35% smaller (PS) but speeds were full-size, so travel felt too fast
+  const CROUCH_SPEED = 1.1 * MOVE_SCALE, WALK = 1.5 * MOVE_SCALE, SPRINT = 4.5 * MOVE_SCALE, JUMP_HEIGHT = 0.60;   // m/s: brisk walk ~6.5 km/h, hard run ~21 km/h
+  const CAM_FX = 0.78;                               // overall strength of camera motion effects (bob, sway, tilt, foot jolts, landing). 1 = old strength, 0 = none. Mouse aim is unaffected.
+  const CAM_POS_FX = 0.82;                          // same idea as CAM_FX but for the positional (metre-based) bob / sway / jolt, so it can be kept a bit stronger than the rotations
+  const PITCH_GAIN = 1.0;                            // chest cam only partly follows where you look up/down
+  const SPEED_RAMP_UP = 2.0, SPEED_RAMP_DOWN = 6;     // how fast the speed *cap* builds / falls (m/s^2): walk -> sprint takes ~1s
+  const GROUND_ACCEL = 4.5, GROUND_DECEL = 8, AIR_ACCEL = 1.2, AIR_DECEL = 0.3;   // little steering once airborne: you keep the momentum you jumped with
+  let curMax = WALK, crouched = false, eyeH = EYE_STAND, sprinting = false;
+  // "Human" feel state
+  const STAMINA_REGEN = 2.5;                         // regen speed multiplier (2.5 = 150% faster)
+  const STAMINA_DRAIN = 0.5;                         // sprint drain multiplier (0.5 = stamina lasts 2x as long)
+  let stamina = 100, regenDelay = 0, exhausted = false, wasGrounded = false, airVy = 0, landY = 0, landV = 0;
+  let dirP = 0, dirLat = 0;
+  let sprintT = 0, ysS = 0, lastYawS = 0, groundSp = 0, recoverT = 0;   // sprint wind-up timer, smoothed turn rate, takeoff speed, post-landing stagger
+  // Layered procedural shake (smooth 1-D value noise on 6 axes, followed through springs)
+  let nzT = 0; const nzX = [0, 0, 0, 0, 0, 0], nzV = [0, 0, 0, 0, 0, 0];
+  const nzHash = n => { const x = Math.sin(n * 127.1 + 311.7) * 43758.5453; return (x - Math.floor(x)) * 2 - 1; };
+  const vnoise = x => { const i = Math.floor(x), f = x - i, u = f * f * (3 - 2 * f); return nzHash(i) + (nzHash(i + 1) - nzHash(i)) * u; };
+  const STAB = 0.20;                                 // head stabilisation: 0 = camera rigidly on chest, 1 = gaze fully held steady (rotational bob removed)
+  const HEAD_LIM = 0.065;                             // head can't travel more than +-5 cm from the neutral position
+  const STEP_INTERVAL_WALK = 0.6, STEP_INTERVAL_SPRINT = 0.4;   // seconds between footsteps: camera bob, footstep sound/jolt and leg animation all run off this clock
+  let stepIdx = -1;
+  let bobPhase = 0, bobAmt = 0, lastStep = 0, roll = 0, smoothY = SPAWN[1], breathT = 0;
+  // Chest-mount camera state: torso-lag springs (yaw/pitch), foot-strike jolt springs, lean
+  let cy = 0, cyV = 0, cp = 0, cpV = 0, jY = 0, jV = 0, jP = 0, jPV = 0, accLong = 0, aSm = 0, hsS = 0, lastYaw = 0, yrS = 0, stress = 0, runBS = 0, cadS = 1.5, airP = 0;
+  let actx = null;
+  function audio() { if (!actx) { try { actx = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {} } return actx; }
+  function thud(vol, freq) {                         // tiny synthesized footstep / landing thump (no assets)
+    const c = audio(); if (!c) return;
+    const o = c.createOscillator(), g = c.createGain(), t = c.currentTime;
+    o.type = 'sine'; o.frequency.setValueAtTime(freq, t); o.frequency.exponentialRampToValueAtTime(40, t + 0.12);
+    g.gain.setValueAtTime(vol, t); g.gain.exponentialRampToValueAtTime(0.001, t + 0.15);
+    o.connect(g); g.connect(c.destination); o.start(t); o.stop(t + 0.16);
+  }
+  const COYOTE = 0.1, JUMP_BUFFER = 0.12;
+  // Jump: takeoff speed is derived from the height you want (v = sqrt(2*g*h)). 0.60 m is a strong standing jump
+  // (~0.7 s in the air); a fit person manages ~0.5-0.7 m. Falling is pulled slightly harder than rising
+  // (FALL_MULT 1.0 = pure physics) so the descent doesn't feel floaty at first-person scale.
+  const JUMP_SPEED = Math.sqrt(2 * -GRAVITY * JUMP_HEIGHT), FALL_MULT = 1.2;
+  let vx = 0, vy = 0, vz = 0;
+  let coyoteT = 0, jumpBuffer = 0, grounded = false;
+  const prevPos = new THREE.Vector3(...SPAWN), curPos = new THREE.Vector3(...SPAWN);
+
+  function respawn(resetCrates) {
+    posVec.Set(SPAWN[0], SPAWN[1] + halfH, SPAWN[2]);
+    character.SetPosition(posVec);
+    refreshContacts(character);
+    vx = vy = vz = 0;
+    prevPos.set(...SPAWN); curPos.set(...SPAWN);
+    // reset movement/camera state too, so the view doesn't glide in from the old spot or keep a stale gait
+    stamina = 100; exhausted = false; regenDelay = 0; curMax = WALK; airVy = 0; landY = 0; landV = 0; coyoteT = 0; jumpBuffer = 0; recoverT = 0; sprintT = 0; groundSp = 0;
+    smoothY = SPAWN[1]; eyeH = crouched ? EYE_CROUCH : EYE_STAND;
+    if (resetCrates) npcRevive();
+    if (resetCrates) {                                // R also puts the crates back (falling off the map only respawns you)
+      for (const d of dynamicBodies) {
+        const pv = new RV(d.home.p[0], d.home.p[1], d.home.p[2]), qv = new J.Quat(d.home.q[0], d.home.q[1], d.home.q[2], d.home.q[3]), zv = new J.Vec3(0, 0, 0);
+        bodies.SetPositionAndRotation(d.id, pv, qv, J.EActivation_Activate);
+        bodies.SetLinearVelocity(d.id, zv); bodies.SetAngularVelocity(d.id, zv);
+        J.destroy(pv); J.destroy(qv); J.destroy(zv);
+      }
+    }
+  }
+
+  // Is there room for the standing capsule? Cast a few rays upward from the feet area (fails open on API errors).
+  function canStand(x, feetY, z) {
+    try {
+      const o2 = RADIUS * 0.7, offs = [[0, 0], [o2, 0], [-o2, 0], [0, o2], [0, -o2]];
+      for (const o of offs)
+        if (castRay(x + o[0], feetY + 0.3 * PS, z + o[1], 0, H_STAND - 0.2 * PS, 0) >= 0) return false;   // something overhead
+    } catch (e) { console.warn('headroom check unavailable', e); }
+    return true;
+  }
+
+  // Switch stance keeping the feet in place by teleporting the other pre-built character to the same feet position.
+  function setStance(toCrouch) {
+    const p = character.GetPosition();
+    const x = p.GetX(), z = p.GetZ(), feetY = p.GetY() - halfH;
+    if (!toCrouch && !canStand(x, feetY, z)) return false;
+    const newH = toCrouch ? H_CROUCH : H_STAND;
+    posVec.Set(x, feetY + newH / 2, z);
+    const next = toCrouch ? charCrouch : charStand;
+    next.SetPosition(posVec);
+    refreshContacts(next);
+    character = next;
+    halfH = newH / 2;
+    return true;
+  }
+
+
+
+  function stepPlayer(dt) {
+    const pvx = vx, pvz = vz;
+    // Ground state straight from Jolt's contact solver (OnGround excludes too-steep slopes -> can't jump on them)
+    jStage = 'GetGroundState';
+    grounded = character.GetGroundState() === J.EGroundState_OnGround;
+    // Landing impact: remember fall speed while airborne, kick the view spring when we touch down
+    if (grounded && !wasGrounded && airVy < -2) {
+      const imp = -airVy;
+      landV = -Math.min(imp, 14) * 0.28;
+      thud(Math.min(0.35, imp * 0.03), 90);
+      const lf = 1 - Math.min(0.2, Math.max(0, imp - 2.5) * 0.04); vx *= lf; vz *= lf;   // knees absorb the impact: a little speed lost
+      curMax = Math.max(WALK * 0.5, curMax - Math.max(0, imp - 4.5) * 0.3);   // only hard landings cost momentum
+      recoverT = Math.max(recoverT, Math.min(0.7, Math.max(0, imp - 4.5) * 0.09));   // hard landing: brief stagger, can't push off at full effort
+    }
+    if (!grounded) airVy = vy;
+    wasGrounded = grounded;
+    landV += (-130 * landY - 15 * landV) * dt; landY += landV * dt;   // damped spring for the landing dip
+    recoverT = Math.max(0, recoverT - dt);
+    if (grounded) groundSp = Math.hypot(vx, vz);       // remembered so a jump keeps its takeoff speed (see air cap below)
+    coyoteT = grounded ? COYOTE : coyoteT - dt;
+    jumpBuffer -= dt;
+
+    // Camera-relative input projected on XZ plane
+    const fx = -Math.sin(cy), fz = -Math.cos(cy);        // move relative to the torso/camera heading (the gun leads, the body follows)
+    const rx = Math.cos(cy), rz = -Math.sin(cy);
+    const iF = (keys.KeyW ? 1 : 0) - (keys.KeyS ? 1 : 0);
+    const iR = (keys.KeyD ? 1 : 0) - (keys.KeyA ? 1 : 0);
+    let dx = fx * iF + rx * iR, dz = fz * iF + rz * iR;
+    const len = Math.hypot(dx, dz);
+    const hasInput = len > 0;
+    if (hasInput) { dx /= len; dz /= len; }
+    // Crouch (hold C): swap capsule; stand back up only if there is headroom
+    const wantCrouch = !!keys.KeyC;
+    if (wantCrouch !== crouched) {
+      const toCrouch = wantCrouch;
+      jStage = 'setStance';
+      if (setStance(toCrouch)) crouched = toCrouch;
+    }
+    // Speed cap ramps toward the desired gait instead of snapping (walk -> sprint builds up gradually)
+    if (exhausted && stamina > 15) exhausted = false;               // winded until stamina recovers to 15%
+    const fwdC = hasInput ? dx * fx + dz * fz : 0;                  // how much of the intended direction is forward (-1 back .. 1 forward)
+    const aimHeld = !thirdPerson && locked && W.rmb && !W.reloading;       // holding aim while sprinting drops you to a walk until you let go
+    sprinting = !crouched && !exhausted && !aimHeld && hasInput && fwdC > 0.5 && (keys.ShiftLeft || keys.ShiftRight);   // sprint only works roughly forward
+    sprintT = sprinting ? Math.min(0.4, sprintT + dt) : 0;
+    // Drain scales with how fast you are actually moving (a slow ramp-up costs little, full sprint ~20s);
+    // recovery only starts 2s after you stop sprinting and is slow, slower still while walking.
+    if (sprinting) { stamina -= (0.6 + 1.0 * Math.max(0, Math.hypot(vx, vz) - WALK)) * STAMINA_DRAIN * dt; regenDelay = 2.0; }
+    else { regenDelay = Math.max(0, regenDelay - dt); if (regenDelay <= 0) stamina += (hasInput ? 1.5 : (crouched ? 5 : 4)) * STAMINA_REGEN * dt; }
+    stamina = Math.max(0, Math.min(100, stamina));
+    if (stamina <= 0) { exhausted = true; sprinting = false; }
+    const desired = crouched ? CROUCH_SPEED : sprinting ? SPRINT : WALK;
+    const wu = Math.min(1, sprintT / 0.4);                          // sprint wind-up: first ~0.4s of a sprint builds speed slowly (planting, leaning in)
+    const ramp = (desired > curMax ? SPEED_RAMP_UP * (desired === SPRINT ? 0.4 + 0.6 * wu * wu * (3 - 2 * wu) : 1) : SPEED_RAMP_DOWN) * dt;
+    curMax = Math.abs(desired - curMax) <= ramp ? desired : curMax + Math.sign(desired - curMax) * ramp;
+    const dirMult = !hasInput ? 1 : fwdC >= 0 ? 0.85 + 0.15 * fwdC : 0.85 + 0.2 * fwdC;   // blends smoothly: forward 100%, sideways 85%, backwards 65%
+    // Uphill slows you, downhill lets you roll faster (uses the ground normal Jolt reports)
+    let slopeMult = 1;
+    if (grounded && hasInput) {
+      try {
+        const n = character.GetGroundNormal();
+        if (n.GetY() > 0.2) slopeMult = Math.max(0.55, Math.min(1.25, 1 + 0.55 * (n.GetX() * dx + n.GetZ() * dz) / n.GetY()));
+      } catch (e) {}
+    }
+    // Each footfall pushes you slightly forward and the gap between steps lets you slow a touch
+    const gait = (hasInput && grounded) ? 1 + (0.03 + 0.05 * Math.min(1, Math.hypot(vx, vz) / SPRINT)) * (crouched ? 0.6 : 1) * Math.sin(bobPhase - 1.2) : 1;   // pulse grows with speed
+    const recMult = 1 - 0.5 * Math.min(1, recoverT / 0.4);          // staggered after a hard landing
+    let tx = dx * curMax * dirMult * slopeMult * gait * recMult, tz = dz * curMax * dirMult * slopeMult * gait * recMult;
+    if (!grounded) {                                   // air: you can't out-run your takeoff. Steering can't push speed past what you left the ground with
+      const cap = Math.max(groundSp, WALK * 0.5), tl = Math.hypot(tx, tz);
+      if (tl > cap) { tx *= cap / tl; tz *= cap / tl; }
+    }
+
+    // Locomotion model. On the ground velocity is split into "along current motion" and "sideways":
+    //  - speeding up is strong from a standstill (first step) and tapers toward top speed
+    //  - braking from a run takes several steps (you can't stop on a dime)
+    //  - changing direction (cornering) is limited, and worse the faster you run, so you carve arcs
+    ysS += (Math.abs(yaw - lastYawS) / dt - ysS) * Math.min(1, 10 * dt); lastYawS = yaw;   // smoothed turn rate (rad/s)
+    const sp = Math.hypot(vx, vz);
+    const ex = tx - vx, ez = tz - vz;
+    if (grounded && sp > 0.6) {
+      const hx = vx / sp, hz = vz / sp;
+      const ep = ex * hx + ez * hz;                       // error along motion
+      const qx = ex - ep * hx, qz = ez - ep * hz;         // error across motion
+      const ql = Math.hypot(qx, qz);
+      const frac = Math.min(1, sp / SPRINT), top = Math.min(1, sp / Math.max(curMax, 0.1));
+      const accel = GROUND_ACCEL * (1.5 - 0.9 * top) * (crouched ? 0.7 : 1);
+      const brake = GROUND_DECEL * (0.7 + 0.3 * (1 - frac)) * (crouched ? 0.8 : 1) * (hasInput ? 1 : Math.min(1, 0.4 + sp / 2.5));   // eases off as you slow, so stopping has no hard edge
+      const corner = (hasInput ? 11 - 5 * frac : 0) * (crouched ? 0.8 : 1);
+      const dp = Math.sign(ep) * Math.min(Math.abs(ep), (ep > 0 ? accel : brake) * dt);
+      vx += hx * dp; vz += hz * dp;
+      // Turning costs speed: sharp direction changes and fast mouse turns at speed scrub momentum (plant the foot, push off sideways)
+      const cosA = hasInput ? hx * dx + hz * dz : 1;
+      const scrub = hasInput ? (Math.max(0, 0.5 - cosA) * 5 + 0.3 * Math.min(1, ysS / 5)) * frac : 0;
+      const sc = Math.max(0, 1 - scrub * dt); vx *= sc; vz *= sc;
+      if (ql > 1e-6) { const dq = Math.min(ql, corner * dt); vx += qx / ql * dq; vz += qz / ql * dq; }
+    } else if (grounded && !hasInput) {
+      // coming to rest: exponential settle (velocity and acceleration both reach zero smoothly, no snap)
+      const f = Math.exp(-6 * dt);
+      vx *= f; vz *= f;
+      if (Math.hypot(vx, vz) < 0.02) { vx = 0; vz = 0; }
+    } else {
+      // near standstill (or airborne): simple approach toward target
+      const rate = grounded ? (hasInput ? GROUND_ACCEL * 1.5 : GROUND_DECEL) : (hasInput ? AIR_ACCEL : AIR_DECEL);
+      const el = Math.hypot(ex, ez), maxD = rate * dt;
+      if (el <= maxD) { vx = tx; vz = tz; } else { vx += ex / el * maxD; vz += ez / el * maxD; }
+    }
+
+    // Vertical: gravity / jump (with coyote time + jump buffer)
+    if (grounded && vy < 0) vy = 0;
+    else if (!grounded) vy += GRAVITY * (vy < 0 ? FALL_MULT : 1) * dt;
+    if (jumpBuffer > 0 && coyoteT > 0) {
+      // Jump height depends on the body: a run-up converts effort into forward speed (lower rise), a crouch has
+      // less leg stroke, and tired legs push less. Takeoff speed = sqrt(2*g*h).
+      const sp0 = Math.hypot(vx, vz);
+      const hm = (crouched ? 0.75 : 1) * (1 - 0.2 * Math.min(1, sp0 / SPRINT)) * (exhausted ? 0.75 : 0.85 + 0.15 * stamina / 100);
+      vy = JUMP_SPEED * Math.sqrt(hm);
+      stamina = Math.max(0, stamina - 4); regenDelay = Math.max(regenDelay, 1.5);   // jumping costs a little stamina
+      jumpBuffer = 0; coyoteT = 0; grounded = false; landV += 0.4;                  // push-off: view rises slightly as the legs extend
+    }
+
+    // Never hand Jolt a NaN / absurd velocity (undefined behaviour inside WASM shows up as "memory access out of bounds")
+    if (!isFinite(vx + vy + vz)) { vx = vy = vz = 0; }
+    vy = Math.max(-60, Math.min(60, vy));
+    velVec.Set(vx, vy, vz);
+    jStage = 'SetLinearVelocity';
+    character.SetLinearVelocity(velVec);
+    jStage = 'ExtendedUpdate';
+    character.ExtendedUpdate(dt, gravityVec, updSettings, bpFilter, layerFilter, bodyFilter, shapeFilter, jolt.GetTempAllocator());
+
+    // Read back the solved velocity so walls / ceilings kill momentum
+    jStage = 'GetLinearVelocity';
+    const v = character.GetLinearVelocity();
+    vx = v.GetX(); vy = v.GetY(); vz = v.GetZ();
+    accLong = ((vx - pvx) * -Math.sin(yaw) + (vz - pvz) * -Math.cos(yaw)) / dt;   // forward accel (m/s^2) for torso lean
+
+    jStage = 'GetPosition';
+    const p = character.GetPosition();
+    prevPos.copy(curPos);
+    curPos.set(p.GetX(), p.GetY() - halfH, p.GetZ());   // store FEET position
+    if (isFinite(curPos.x + curPos.y + curPos.z)) { lastGood.x = curPos.x; lastGood.y = curPos.y; lastGood.z = curPos.z; }
+    if (curPos.y < -25) respawn();
+  }
+
+  // Physics errors (e.g. WASM "memory access out of bounds") are caught so the page keeps running, and shown in the
+  // HUD with the stage and the top of the stack so we can see exactly which call failed.
+  let jStage = '';                                    // which Jolt call stepPlayer was in (reported if it throws)
+  const lastGood = { x: SPAWN[0], y: SPAWN[1], z: SPAWN[2] };   // last finite feet position, used to recover
+  function recoverPlayer() {                          // after a physics error: put the character back where it last was fine
+    try { posVec.Set(lastGood.x, lastGood.y + halfH, lastGood.z); character.SetPosition(posVec); refreshContacts(character); } catch (e) {}
+    vx = vy = vz = 0;
+    prevPos.set(lastGood.x, lastGood.y, lastGood.z); curPos.copy(prevPos);
+  }
+  let errText = '', errAt = -1e9, errCount = 0;
+  function reportError(stage, err) {
+    errCount++;
+    const stack = String(err && err.stack || '').split('\n').slice(0, 4).map(s => s.trim()).join(' | ');
+    errText = '⚠ ' + stage + ' (x' + errCount + '): ' + String(err && err.message || err) + (stack ? '\n   ' + stack.slice(0, 160) : '');
+    errAt = performance.now();
+    console.error('[' + stage + ']', err);
+  }
+
+  // ---------------------------------------------------------------- 5. DEMO WEAPON (Bodycam-style)
+  // One rectangle for a gun. Chest-mounted view, real projectiles with travel time + drop, heavy sway/lag,
+  // low-ready sprint, wall-raise, tactical vs empty reloads (no HUD ammo in the real game; the debug HUD shows it here).
+  const W = { MAG: 30, RPM: 650, MUZZLE_V: 450, GRAV: 9.81, ammo: 31, auto: false, reloading: false, rlT: 0, rlDur: 2, rlEv: 0, rlTarget: 31,
+              fireCd: 0, held: false, semiReady: true, rmb: false, ads: 0, adsT: 0, rg: -1, rgS: 1, hoL: new THREE.Vector3(), hoR: new THREE.Vector3(), hpL: new THREE.Vector3(), hpR: new THREE.Vector3(), hpLT: new THREE.Vector3(), hpRT: new THREE.Vector3(), rvL: new THREE.Vector3(-0.008, -0.012, 0.022), rvR: new THREE.Vector3(0.006, 0.014, -0.008), rvDur: 0.4, rvDel: 0.15, gq: 0, gqV: 0, hbL: new THREE.Vector3(), hbR: new THREE.Vector3(), gx: 0, gxV: 0, gy: 0, gyV: 0, gr: 0, grV: 0, gw: 0, gwV: 0, wasAds: false, shotInAds: false, av: null, sprintB: 0, wallB: 0, lagY: 0, lagP: 0, lastYaw: 0, lastPitch: 0,
+              kz: 0, kzV: 0, kr: 0, krV: 0, cp: 0, cpV: 0, cr: 0, crV: 0, recDebt: 0, burst: 0, recDir: 1, sinceShot: 9, flash: 0, gY: 0, gP: 0, hY: 0, hP: 0, cvY: 0, cvP: 0, pY: 0, pP: 0, lx: 0, ly: 0, lz: 0, lastPos: new THREE.Vector3() };
+  // AK-74 (wood furniture, orange plum magazine), modelled from a side-view photo. Local space, metres: bore axis = the Z axis through the
+  // origin, muzzle toward -Z (tip at z = -0.325), stock toward +Z (butt at z = +0.26). Outline parts (stock, magazine) are extruded side profiles.
+  const gun = new THREE.Group();
+  {
+    const steel = new THREE.MeshStandardMaterial({ color: 0x1b1c1f, roughness: 0.45, metalness: 0.75 });
+    const dark  = new THREE.MeshStandardMaterial({ color: 0x26282c, roughness: 0.55, metalness: 0.6 });
+    const wood  = new THREE.MeshStandardMaterial({ color: 0x8a4521, roughness: 0.7, metalness: 0.05 });
+    const plum  = new THREE.MeshStandardMaterial({ color: 0xb8561a, roughness: 0.6, metalness: 0.05 });
+    const box = (w, h, d, x, y, z, mat, rx = 0) => { const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat); m.position.set(x, y, z); m.rotation.x = rx; gun.add(m); return m; };
+    const cyl = (r, len, x, y, z, mat) => { const m = new THREE.Mesh(new THREE.CylinderGeometry(r, r, len, 14), mat); m.rotation.x = Math.PI / 2; m.position.set(x, y, z); gun.add(m); return m; };
+    // side profile [z, y] points, extruded sideways (x) and centred on the gun's midline
+    const prof = (pts, width, mat) => {
+      const g = new THREE.ExtrudeGeometry(new THREE.Shape(pts.map(q => new THREE.Vector2(q[0], q[1]))), { depth: width, bevelEnabled: false });
+      g.rotateY(-Math.PI / 2); g.translate(width / 2, 0, 0);
+      const m = new THREE.Mesh(g, mat); gun.add(m); return m;
+    };
+    // barrel, muzzle brake, front sight, gas tube
+    cyl(0.0065, 0.20, 0, 0, -0.22, steel);                         // barrel
+    cyl(0.0095, 0.034, 0, 0, -0.308, steel);                       // muzzle brake
+    cyl(0.0075, 0.012, 0, 0, -0.286, steel);                       // brake neck
+    box(0.018, 0.022, 0.026, 0, 0.002, -0.275, steel);             // front sight base / gas block
+    box(0.004, 0.026, 0.006, 0, 0.0175, -0.275, steel);            // front sight post
+    box(0.004, 0.008, 0.012, 0, 0.032, -0.275, steel);             // post tip
+    cyl(0.0072, 0.17, 0, 0.0125, -0.19, steel);                    // gas tube
+    // wood furniture around the tube and barrel
+    box(0.038, 0.017, 0.067, 0, 0.0145, -0.1395, wood);            // upper handguard
+    box(0.044, 0.040, 0.103, 0, -0.0122, -0.1255, wood);           // lower handguard
+    // receiver, dust cover and rear sight
+    box(0.040, 0.050, 0.171, 0, -0.005, 0.0115, dark);             // receiver
+    box(0.036, 0.008, 0.150, 0, 0.0185, 0.022, steel);             // dust cover top
+    box(0.022, 0.014, 0.046, 0, 0.0245, -0.078, steel);            // rear sight housing
+    box(0.012, 0.007, 0.030, 0, 0.0305, -0.078, steel);            // rear sight leaf
+    box(0.006, 0.006, 0.055, 0, -0.057, 0.034, steel);             // trigger guard
+    box(0.007, 0.010, 0.052, 0.025, -0.008, 0.043, steel);         // charging handle
+    box(0.012, 0.012, 0.012, 0.025, -0.008, 0.073, steel);         // charging handle knob
+    box(0.031, 0.075, 0.030, 0, -0.066, 0.073, wood, -0.27);       // pistol grip (raked back)
+    // stock: side profile from the photo (top nearly level with the bore, belly dropping toward the butt)
+    prof([[0.258, -0.0053], [0.101, -0.0015], [0.094, -0.0076], [0.090, -0.030], [0.151, -0.052], [0.227, -0.070], [0.256, -0.071]], 0.034, wood);
+    // magazine: curved, sweeping forward toward the muzzle
+    prof([[-0.002, -0.020], [-0.040, -0.016], [-0.0605, -0.070], [-0.0795, -0.1155], [-0.046, -0.138], [-0.021, -0.085]], 0.034, plum);
+  }
+  // The gun lives in the world, anchored to the body and aimed by the mouse. It is NOT attached to the camera: the camera is the one that follows the gun.
+  const gunRoot = new THREE.Group(); gunRoot.rotation.order = 'YXZ';
+  scene.add(gunRoot); gunRoot.add(gun);
+  const MUZ = new THREE.Vector3(0, 0, -0.325);
+  const flashMesh = new THREE.Mesh(new THREE.PlaneGeometry(0.16, 0.16), new THREE.MeshBasicMaterial({ color: 0xffd88a, transparent: true, opacity: 0, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide }));
+  flashMesh.position.set(0, 0, -0.345);
+  const flashLight = new THREE.PointLight(0xffb866, 0, 8);
+  flashLight.position.copy(MUZ);
+  gun.add(flashMesh, flashLight);
+  const _v1 = new THREE.Vector3(), _v2 = new THREE.Vector3(), _v3 = new THREE.Vector3(), _v4 = new THREE.Vector3(), _q = new THREE.Quaternion();
+  const clampf = (v, a, b) => Math.max(a, Math.min(b, v));
+  const lerpf = (a, b, t) => a + (b - a) * t;
+
+  // Same as castRay() but also reports which body was hit
+  function castRayHit(ox, oy, oz, dx, dy, dz) {
+    const nq = physics.GetNarrowPhaseQuery();
+    let oV, dV, ray, hit;
+    try {
+      oV = new RV(ox, oy, oz); dV = new J.Vec3(dx, dy, dz); ray = new J.RRayCast(oV, dV);
+      if (NEW_RAY_API) {
+        rayCollector.Reset();
+        nq.CastRay(ray, raySettings, rayCollector, bpFilter, layerFilter, bodyFilter, shapeFilter);
+        return rayCollector.HadHit() ? { f: rayCollector.mHit.mFraction, idx: rayCollector.mHit.mBodyID.GetIndex() } : null;
+      }
+      hit = new J.RayCastResult();
+      return nq.CastRay(ray, hit, bpFilter, layerFilter, bodyFilter) ? { f: hit.mFraction, idx: hit.mBodyID.GetIndex() } : null;
+    } finally { for (const w of [hit, ray, oV, dV]) if (w) J.destroy(w); }
+  }
+
+  // Sound
+  let shotBuf = null;
+  function gunshot() {
+    const c = audio(); if (!c) return;
+    if (!shotBuf) {
+      const n = (c.sampleRate * 0.4) | 0; shotBuf = c.createBuffer(1, n, c.sampleRate);
+      const d = shotBuf.getChannelData(0); for (let i = 0; i < n; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / n, 3);
+    }
+    const s = c.createBufferSource(), lp = c.createBiquadFilter(), g = c.createGain();
+    s.buffer = shotBuf; lp.type = 'lowpass'; lp.frequency.value = 2600; g.gain.value = 0.45;
+    s.connect(lp); lp.connect(g); g.connect(c.destination); s.start();
+    thud(0.22, 65);
+  }
+
+  // Bullets, impacts
+  const bullets = [], puffs = [], holes = [];
+  const tracerGeo = new THREE.BoxGeometry(0.01, 0.01, 0.8), tracerMat = new THREE.MeshBasicMaterial({ color: 0xffe7a3, transparent: true, opacity: 0.75 });
+  const puffGeo = new THREE.SphereGeometry(0.05, 8, 6), holeGeo = new THREE.SphereGeometry(0.03, 6, 4), holeMat = new THREE.MeshBasicMaterial({ color: 0x151515 });
+  let crateIdx = null, holeN = 0;
+  function crateFor(idx) {
+    if (!crateIdx) { crateIdx = new Map(); for (const d of dynamicBodies) { try { crateIdx.set(d.id.GetIndex(), d); } catch (e) {} } }
+    return crateIdx.get(idx);
+  }
+  function impact(p, v, idx) {
+    const d = crateFor(idx);
+    if (idx === NPC_IDX) npcHit(p, v);
+    else if (d) {
+      let imp, pt;
+      try {
+        const k = 90 / v.length(); imp = new J.Vec3(v.x * k, v.y * k, v.z * k); pt = new RV(p.x, p.y, p.z);
+        bodies.ActivateBody(d.id);
+        try { bodies.AddImpulse(d.id, imp, pt); } catch (e) { bodies.AddImpulse(d.id, imp); }
+      } catch (e) { console.warn('impulse failed', e); } finally { for (const o of [imp, pt]) if (o) J.destroy(o); }
+    } else {
+      let h = holes[holeN % 60];
+      if (!h) { h = new THREE.Mesh(holeGeo, holeMat); scene.add(h); holes[holeN % 60] = h; }
+      h.position.copy(p); holeN++;
+    }
+    const m = new THREE.Mesh(puffGeo, new THREE.MeshBasicMaterial({ color: 0xc9c2b0, transparent: true, opacity: 0.6, depthWrite: false }));
+    m.position.copy(p); scene.add(m); puffs.push({ m, t: 0 });
+  }
+  function updateBullets(fdt) {
+    for (let i = bullets.length - 1; i >= 0; i--) {
+      const b = bullets[i]; let rem = fdt, dead = false; b.life += fdt;
+      while (rem > 0 && !dead) {
+        const h = Math.min(rem, 1 / 120); rem -= h; b.v.y -= W.GRAV * h;
+        const sx = b.v.x * h, sy = b.v.y * h, sz = b.v.z * h;
+        let r = null; try { r = castRayHit(b.p.x, b.p.y, b.p.z, sx, sy, sz); } catch (e) {}
+        if (r) { b.p.set(b.p.x + sx * r.f, b.p.y + sy * r.f, b.p.z + sz * r.f); impact(b.p, b.v, r.idx); dead = true; }
+        else b.p.set(b.p.x + sx, b.p.y + sy, b.p.z + sz);
+      }
+      if (b.life > 4 || b.p.y < -20) dead = true;
+      if (dead) { scene.remove(b.m); bullets.splice(i, 1); continue; }
+      b.m.position.copy(b.p); b.m.lookAt(_v1.copy(b.p).add(b.v));
+    }
+    for (let i = puffs.length - 1; i >= 0; i--) {
+      const f = puffs[i]; f.t += fdt;
+      if (f.t > 0.35) { scene.remove(f.m); f.m.material.dispose(); puffs.splice(i, 1); continue; }
+      f.m.scale.setScalar(1 + f.t * 10); f.m.material.opacity = 0.6 * (1 - f.t / 0.35);
+    }
+  }
+
+  function shoot() {
+    W.ammo--; W.fireCd = 60 / W.RPM; W.sinceShot = 0;
+    if (W.adsT > 0.05) W.shotInAds = true;                       // you were firing while aiming: the hands stay put, no re-grip afterwards
+    gun.updateWorldMatrix(true, false);
+    const mp = gun.localToWorld(_v1.copy(MUZ));                 // bullets leave the barrel, along the barrel (not the crosshair)
+    gun.getWorldQuaternion(_q);
+    const d = _v2.set(0, 0, -1).applyQuaternion(_q);
+    const spread = (0.028 * (1 - W.ads) + 0.003 + 0.02 * Math.min(1, hsS / 5) + (grounded ? 0 : 0.03)) * (crouched ? 0.6 : 1);
+    const a = Math.random() * 6.283, r = Math.sqrt(Math.random()) * spread;
+    d.addScaledVector(_v3.set(1, 0, 0).applyQuaternion(_q), Math.cos(a) * r).addScaledVector(_v4.set(0, 1, 0).applyQuaternion(_q), Math.sin(a) * r).normalize();
+    const mesh = new THREE.Mesh(tracerGeo, tracerMat); scene.add(mesh);
+    bullets.push({ p: mp.clone(), v: d.clone().multiplyScalar(W.MUZZLE_V), m: mesh, life: 0 });
+    // ---- Recoil model: a repeatable vertical climb plus a drifting sideways pattern, scaled by stance and by how long you hold the trigger.
+    //  * burst = how many rounds you have fired in this string of fire (it bleeds off when you stop). The first round kicks hardest, the
+    //    climb then settles into a steady rise and tightens slightly as the weapon beds into the shoulder.
+    //  * horizontal: a drift direction chosen at the start of each burst (right-handed shooters push right and up), with a slow weave
+    //    on top and a little random noise. Shot-to-shot noise is small, so the pattern can actually be learned and countered.
+    //  * ADS, crouching and a planted stance steady the gun; moving, jumping and exhaustion make it worse.
+    if (W.burst < 0.5) W.recDir = Math.random() < 0.65 ? 1 : -1;
+    const n = W.burst++;
+    const stance = (1 - 0.32 * W.ads) * (crouched ? 0.78 : 1) * (1 + 0.45 * Math.min(1, hsS / 3.5)) * (grounded ? 1 : 1.6) * (1 + 0.25 * stress);
+    const climb = n < 1 ? 1.4 : n < 4 ? 1.15 : n < 12 ? 1 : 0.85;
+    const kp = 0.0135 * climb * stance * (0.9 + Math.random() * 0.2);
+    const noise = (Math.random() + Math.random() + Math.random() - 1.5) * 0.0034;
+    const ky = (W.recDir * 0.0022 + Math.sin(n * 0.55 + 0.6) * 0.0035 * W.recDir + noise) * stance;
+    lookInput(ky, kp); W.recDebt += kp;
+    const vis = (n < 1 ? 1.25 : 0.9) * stance;                     // visual shoulder / wrist kick follows the same scaling
+    W.kzV += 1.5 * vis; W.krV += 2.6 * vis; W.cpV += 1.3 * vis; W.crV += (W.recDir * 0.4 + (Math.random() - 0.5) * 0.9) * stance;
+    W.flash = 1; flashMesh.rotation.z = Math.random() * 6.283;
+    gunshot();
+  }
+  // Muzzle-led aim: the mouse (and recoil) moves the gun's aim heading 1:1. The chest-mounted camera is NOT locked to it,
+  // it chases the gun with a slow spring (see the cy/cp springs in the frame loop), so the gun leads and the view catches up.
+  function lookInput(dy, dp) { yawT += dy; pitchT = clampf(pitchT + dp, -1.55, 1.55); }
+  function startReload() {
+    if (W.reloading || thirdPerson || W.ammo >= W.MAG + 1) return;
+    const empty = W.ammo === 0;                                  // tactical reload keeps the chambered round (31); empty needs a bolt charge (30)
+    W.reloading = true; W.rlT = 0; W.rlEv = 0; W.rlDur = empty ? 2.7 : 2.0; W.rlTarget = empty ? W.MAG : W.MAG + 1;
+  }
+  const wpnHud = () => W.ammo + (W.reloading ? ' (reloading)' : '') + ' · ' + (W.auto ? 'auto' : 'semi');
+
+  document.addEventListener('mousedown', e => { if (!locked) return; if (e.button === 0) W.held = true; if (e.button === 2) W.rmb = true; });
+  document.addEventListener('mouseup', e => { if (e.button === 0) { W.held = false; W.semiReady = true; } if (e.button === 2) W.rmb = false; });
+  document.addEventListener('contextmenu', e => e.preventDefault());
+  document.addEventListener('pointerlockchange', () => { W.held = W.rmb = false; W.semiReady = true; });
+  addEventListener('keydown', e => {
+    if (e.repeat) return;
+    if (e.code === 'KeyR') startReload();
+    if (e.code === 'KeyX') { W.auto = !W.auto; thud(0.05, 500); }
+  });
+  const bcTime = document.getElementById('bcTime');
+  setInterval(() => { const d = new Date(); bcTime.textContent = d.toLocaleDateString('en-CA') + '  ' + d.toLocaleTimeString('en-GB'); }, 250);
+
+  // Weapon heading + ADS blend. Runs BEFORE updateRig so the body turns to this frame's gun heading (it used to get last frame's,
+  // which made the shoulders lag the hands by a frame and jitter the arms on fast turns).
+  const ADS_RAISE = 0.8, ADS_LOWER = 0.5;                      // seconds to bring the gun up to aim / back down to the hip
+  function updateAim(fdt) {
+    const wantAds = !thirdPerson && locked && W.rmb && !W.reloading;
+    // Raising the rifle to the shoulder takes ADS_RAISE seconds (lowering is quicker). adsT is the linear progress through the raise, and
+    // W.ads (used by everything else) is a smooth ease of it, so the movement starts slowly, accelerates, then brakes into the shoulder.
+    // Letting go halfway reverses the motion from wherever it got to.
+    // Every raise (and every lowering) gets its own randomised path, so the aim animation is never the same twice: how high the rifle
+    // swings, how far back it is pulled, which way it cants, muzzle angle, sideways drift, a little wrist wobble, and when in the move
+    // the peak of the arc happens. Duration stays fixed at ADS_RAISE.
+    if (!W.avT || wantAds !== W.wasAds) {
+      const rnd = Math.random, rr = (x, y) => x + (y - x) * rnd();
+      W.avT = { lift: rr(0.6, 1.4), back: rr(0.5, 1.4), cant: (rnd() < 0.5 ? -1 : 1) * rr(0.06, 0.26), pitch: rr(-0.03, 0.12), side: rr(-0.025, 0.025),
+                skew: rr(0.8, 1.3), thump: rr(0.5, 1.1), wob: rr(0.003, 0.011), wf: rr(0.8, 1.6), wp: rr(0, 6.283), yaw: rr(-0.04, 0.04) };
+      if (!W.av) W.av = Object.assign({}, W.avT);
+      W.wasAds = wantAds;
+      if (wantAds) W.shotInAds = false;                          // a fresh raise starts a fresh count
+    }
+    {   // glide the live values toward the new roll instead of swapping them, so changing your mind mid-raise never makes the gun jump
+      const kv = 1 - Math.exp(-7 * fdt);
+      for (const k in W.avT) { if (k !== 'wp') W.av[k] += (W.avT[k] - W.av[k]) * kv; else W.av[k] = W.avT[k]; }
+    }
+    const prevT = W.adsT;
+    W.adsT = wantAds ? Math.min(1, W.adsT + fdt / ADS_RAISE) : Math.max(0, W.adsT - fdt / ADS_LOWER);
+    const tt = W.adsT;
+    W.ads = tt * tt * tt * (tt * (6 * tt - 15) + 10);
+    if (((prevT < 1 && tt >= 1) || (prevT > 0 && tt <= 0)) && !W.shotInAds) {   // the move just finished: the hands re-grip the rifle (not if you fired while aiming)
+      const m = tt >= 1 ? 1 : 0.7;
+      {   // every re-grip is different: how long it takes, how far each hand goes and in which directions, and how long the trigger hand waits
+        const rr = (lo, hi) => lo + (hi - lo) * Math.random(), sgn = (pPos = 0.5) => (Math.random() < pPos ? 1 : -1);
+        W.rvDur = 0.55; W.rvDel = rr(0.04, 0.28);
+        W.rvL.set(-0.008 * rr(0.3, 1.6) * sgn(0.75), -0.012 * rr(0.3, 1.6) * sgn(0.2), 0.022 * rr(0.4, 1.6) * sgn());
+        W.rvR.set(0.006 * rr(0.3, 1.6) * sgn(0.75), 0.014 * rr(0.3, 1.6) * sgn(0.85), -0.008 * rr(0.3, 1.6) * sgn());
+      }
+      W.rg = 0; W.rgM = m;                  // start the hands' re-grip (see updateWeapon)
+      const r4 = () => (Math.random() - 0.5) * 0.008;                              // the new grip settles a few mm from the old one
+      W.hpLT.set(r4(), r4(), r4() * 2); W.hpRT.set(r4(), r4(), r4());
+    }
+    if (prevT < 1 && tt >= 1) W.kzV += 0.3 * W.av.thump;                       // the stock seats into the shoulder with a small thump
+    // The gun sits at the aim heading; the camera trails it, so on screen the gun is simply ahead of the view by (aim - camera)
+    // Weapon spring arm (the video's second technique): the gun has its own, faster rotation lag, which smooths its motion and keeps it ahead of the camera
+    // Keep normal weapon lag at the hip, but make the gun track mouse aim almost instantly in ADS.
+    const gk = 1 - Math.exp(-lerpf(14, 110, W.ads) * fdt);
+    W.hY += (yaw - W.hY) * gk; W.hP += (pitch * PITCH_GAIN - W.hP) * gk;
+    const swing = 1;                                                 // the gun sits exactly where it is aimed, relative to the camera
+    W.gY = clampf((W.hY - cy) * swing, -2.2, 2.2); W.gP = clampf((W.hP - cp) * swing, -1.4, 1.4);   // the gun may lead the view by a lot
+  }
+  function updateWeapon(fdt, now) {
+    const fp = !thirdPerson, t = now / 1000;
+    gun.visible = true;
+    // FOV zoom + reduced mouse sensitivity from the ADS blend (updateAim); sprint blend
+    W.sprintB += ((sprinting && fp ? 1 : 0) - W.sprintB) * Math.min(1, 7 * fdt);
+    const fov = 110;                                // fixed FOV: aiming down sights no longer zooms in
+    if (Math.abs(camera.fov - fov) > 0.01) { camera.fov = fov; camera.updateProjectionMatrix(); }
+    SENS = SENS0 * (1 - 0.4 * W.ads);
+    // Wall: raise the weapon to high-ready and block firing when something is close in front
+    let wt = 0;
+    if (fp) { try {
+      _v1.set(0, 0, -1).applyQuaternion(gunRoot.quaternion);
+      const f = castRay(camera.position.x, camera.position.y, camera.position.z, _v1.x * 0.75, _v1.y * 0.75, _v1.z * 0.75);
+      if (f >= 0) wt = clampf((0.72 - f * 0.75) / 0.35, 0, 1);
+    } catch (e) {} }
+    W.wallB += (wt - W.wallB) * Math.min(1, 12 * fdt);
+    // ---- Hand re-grip, and the gun shake it causes. -------------------------------------------------------------------------
+    // After the rifle comes up (or goes down) the hands re-adjust: the support hand opens, drops and slides along the handguard, then the
+    // trigger hand lifts up the grip and shifts, one slightly after the other. Each is a single smooth in-and-out motion (zero speed at
+    // both ends) and they end a few mm from where they started. The rifle is only held by those two hands, so it is not shaken directly:
+    // its pitch / yaw / roll / position are driven by where the hands push it (support hand dropping pitches the muzzle down, a hand moving
+    // sideways yaws it, the hands moving apart twists it). It follows through a lightly damped spring, because the rifle has weight.
+    if (W.rg >= 0) { W.rg += fdt / W.rvDur; if (W.rg >= 1) W.rg = -1; }
+    const rgm = W.rg < 0 ? 0 : (W.rgM || 1);
+    const ease = q => { q = Math.max(0, Math.min(1, q)); return Math.sin(Math.PI * q * q * (3 - 2 * q)); };
+    const bL = ease(W.rg / (1 - W.rvDel)) * rgm, bR = ease((W.rg - W.rvDel) / (1 - W.rvDel)) * rgm;          // support hand first, trigger hand a beat later
+    const hk = 1 - Math.exp(-6 * fdt);
+    W.hpL.lerp(W.hpLT, hk); W.hpR.lerp(W.hpRT, hk);
+    W.hbL.copy(W.rvL).multiplyScalar(bL);                                // support hand: out, down, along the handguard
+    W.hbR.copy(W.rvR).multiplyScalar(bR);                                 // trigger hand: out, up the grip, back / forward
+    W.hoL.copy(W.hbL).add(W.hpL); W.hoR.copy(W.hbR).add(W.hpR);
+    const tgq = 3.0 * W.hbL.y - 2.5 * W.hbR.y;                                            // support hand dropping / trigger hand lifting -> muzzle dips
+    const tgw = -4.0 * W.hbL.x + 3.0 * W.hbR.x;                                           // hands pushing sideways -> muzzle yaws
+    const tgr = -3.0 * (W.hbL.x - W.hbR.x);                                               // hands moving apart sideways -> rifle twists
+    const tgx = 0.4 * (W.hbL.x + W.hbR.x), tgy = 0.4 * (W.hbL.y + W.hbR.y);              // and the whole rifle shifts with them
+    for (let rem = fdt; rem > 0;) {
+      const h = Math.min(rem, 1 / 120); rem -= h;
+      W.kzV += (-520 * W.kz - 18 * W.kzV) * h; W.kz += W.kzV * h;
+      W.krV += (-380 * W.kr - 13 * W.krV) * h; W.kr += W.krV * h;
+      W.cpV += (-320 * W.cp - 14 * W.cpV) * h; W.cp += W.cpV * h;
+      W.crV += (-260 * W.cr - 12 * W.crV) * h; W.cr += W.crV * h;
+      W.gxV += (-650 * (W.gx - tgx) - 30 * W.gxV) * h; W.gx += W.gxV * h;     // gun follows the hands (lightly damped)
+      W.gyV += (-650 * (W.gy - tgy) - 30 * W.gyV) * h; W.gy += W.gyV * h;
+      W.gqV += (-650 * (W.gq - tgq) - 30 * W.gqV) * h; W.gq += W.gqV * h;
+      W.grV += (-650 * (W.gr - tgr) - 30 * W.grV) * h; W.gr += W.grV * h;
+      W.gwV += (-650 * (W.gw - tgw) - 30 * W.gwV) * h; W.gw += W.gwV * h;
+    }
+    // Reload progress
+    let rd = 0, rwob = 0;
+    if (W.reloading) {
+      W.rlT += fdt; const p = W.rlT / W.rlDur, evs = [0.28, 0.58, 0.85];
+      if (W.rlEv < 3 && p >= evs[W.rlEv]) { thud(0.09, [200, 150, 260][W.rlEv]); W.rlEv++; }
+      rd = clampf(Math.min(p / 0.18, (1 - p) / 0.18), 0, 1); rwob = Math.sin(p * 40) * 0.02 * rd;
+      if (p >= 1) { W.reloading = false; W.ammo = W.rlTarget; }
+    }
+    // Pose = hip -> ADS blend, then low-ready (sprint), high-ready (wall), reload dip, bob, breath, kick
+    const a = W.ads, adsK = 1 - 0.65 * a, sb = W.sprintB, wb = W.wallB;
+    const sw = (0.6 + a * 1.4) * (1 + 2.5 * stress) * lerpf(2.2, 1, a);   // hip sway is much larger than before
+    let x = lerpf(0, 0, a), y = lerpf(-0.20, -0.030, a), z = lerpf(-0.30, -0.36, a);   // hip carry: centred on the body, tucked in close to the torso
+    let rx = 0, ry = 0, rz = 0;
+    // Lift path: the rifle doesn't slide straight from hip to sights, it rises in an arc (up and back toward the face, canted, muzzle a touch
+    // high) and then settles level onto the sights. arc is 0 at the hip and at the sights, 1 halfway.
+    const av = W.av || { lift: 1, back: 1, cant: 0.16, pitch: 0.07, side: 0.012, skew: 1, thump: 1, wob: 0.01, wf: 1.6, wp: 0, yaw: 0 };
+    const arc = Math.sin(Math.PI * Math.pow(W.ads, av.skew));
+    y += 0.03 * av.lift * arc; z += 0.05 * av.back * arc; rz += av.cant * arc * (1 - 0.4 * W.adsT); rx += av.pitch * arc; x += av.side * arc;
+    ry += av.yaw * arc + av.wob * Math.sin(6.283 * av.wf * W.ads + av.wp) * arc;
+    x += Math.sin(bobPhase / 2) * 0.012 * bobAmt * adsK + Math.sin(t * 0.9) * 0.0012 * sw;
+    y += Math.cos(bobPhase) * 0.009 * bobAmt * adsK + Math.sin(t * 1.3 + 1) * 0.0012 * sw;
+    rx += Math.sin(t * 0.65 + 1) * 0.003 * sw + Math.sin(t * 1.9) * 0.0012 * sw + W.kr;
+    ry += Math.sin(t * 0.8) * 0.003 * sw + Math.sin(t * 2.1 + 2) * 0.0012 * sw ;
+    x = lerpf(x, 0, sb); y = lerpf(y, -0.20, sb); z = lerpf(z, -0.33, sb); rx += -0.75 * sb; ry += 0.35 * sb; rz += -0.2 * sb;
+    rx += 0.9 * wb; y -= 0.03 * wb; z += 0.10 * wb;
+    x -= 0.03 * rd; y -= 0.07 * rd; rz += 0.55 * rd; rx += 0.25 * rd + rwob;
+    z += W.kz;
+    x += W.gx; y += W.gy; rx += W.gq; rz += W.gr; ry += W.gw;     // rifle motion caused by the hands re-gripping
+    // Second 'spring arm' for the weapon (from the video): the gun trails the camera's own motion, which also smooths the bob and steps
+    _v1.copy(camera.position).sub(W.lastPos); W.lastPos.copy(camera.position);
+    _v1.applyQuaternion(_q.copy(camera.quaternion).invert());
+    if (!fp || _v1.lengthSq() > 0.25) _v1.set(0, 0, 0);          // no lag while hidden or after a teleport
+    // Walking inertia is pronounced at the hip, but nearly disappears when aiming down sights.
+    const dragAmount = lerpf(1, 0.035, W.ads);
+    const dragSettle = lerpf(9, 24, W.ads);
+    const lk = Math.exp(-dragSettle * fdt);
+    W.lx = clampf(W.lx - _v1.x * 0.8 * dragAmount, -0.05 * dragAmount, 0.05 * dragAmount) * lk;
+    W.ly = clampf(W.ly - _v1.y * 0.8 * dragAmount, -0.05 * dragAmount, 0.05 * dragAmount) * lk;
+    W.lz = clampf(W.lz - _v1.z * 0.8 * dragAmount, -0.05 * dragAmount, 0.05 * dragAmount) * lk;
+    x += W.lx; y += W.ly; z += W.lz;
+    gun.position.set(x, y, z); gun.rotation.set(rx, ry, rz);
+    if (thirdPerson) {
+      // In third person the weapon is anchored to the character's chest, never to the chase camera.
+      R.root.updateMatrixWorld(true);
+      gunRoot.position.copy(R.root.localToWorld(new THREE.Vector3(0, 4.55, -0.36)));   // chest height
+      gun.position.y += 0.13;                       // third person doesn't take the lower first-person hip carry
+      gunRoot.rotation.set(pitch + W.gP, yaw + W.gY, 0, 'YXZ');
+    } else {
+      gunRoot.position.copy(camera.position);
+      gunRoot.rotation.set(cp + W.gP, cy + W.gY, 0, 'YXZ');
+    }
+    // Trigger
+    W.fireCd -= fdt; W.sinceShot += fdt;
+    if (W.sinceShot > 0.14) W.burst = Math.max(0, W.burst - 12 * fdt);   // the pattern resets after a short pause
+    const can = fp && locked && !W.reloading && W.sprintB < 0.4 && W.wallB < 0.6;
+    if (W.held && can && W.fireCd <= 0 && (W.auto || W.semiReady)) {
+      if (W.ammo > 0) shoot(); else { W.fireCd = 0.25; thud(0.04, 700); }
+      W.semiReady = false;
+    }
+    if (W.sinceShot > 0.12 && W.recDebt > 0) { const rec = W.recDebt * Math.min(1, 3.5 * fdt); lookInput(0, -rec * 0.6); W.recDebt -= rec; }   // the muzzle settles back down, recovering ~60% of the climb
+    W.flash = Math.max(0, W.flash - fdt * 28);
+    flashMesh.material.opacity = W.flash * 0.9; flashLight.intensity = W.flash * 3.5;
+    camera.rotation.x += W.cp; camera.rotation.z += W.cr;          // firing shakes the chest cam
+    updateBullets(fdt);
+  }
+
+  // ---- Two-handed weapon IK -------------------------------------------------------------------------------------------
+  // Solved in the rig's own space (studs), joint to joint:
+  //  * the shoulder is the REAL shoulder joint of the animated pose. (The UpperArm frame origin is the middle of the arm, so the old
+  //    solver started every arm ~9 cm below the body and the arms floated away from the torso.)
+  //  * the hand centre goes on a grip point of the gun; the hand is aligned to the forearm, with its palm on the gun's side.
+  //  * the elbow comes from a two-bone solve with a down-and-out pole vector, so it can't flip.
+  //  * reach: if the gun is farther than the arm can reach, the shoulder rolls forward first (protraction), then the arm lengthens
+  //    a little. The forearm therefore never detaches from the hand, and each segment mesh is stretched to span exactly joint-to-joint.
+  // IK-BEGIN
+  const IK_SH = 0.43, IK_UP = 0.86, IK_LO = 0.80, IK_WR = 0.23;   // shoulder offset in the UpperArm frame; upper/lower bone length; wrist offset in the Hand frame (= JOINT_DEFS)
+  const IK_ARM = 1.30;                  // arm length vs the animated rig: a rifle held out front needs longer arms than the R15 proportions give
+  const IK_PROTRACT = 0.34;             // most the shoulder can roll forward toward the gun (studs)
+  const IK_MAX_STRETCH = 1.6;           // most the arm may lengthen once protraction is used up
+  const IK_POLE = new THREE.Vector3(0.55, -1, 0.15);   // elbow direction hint (right arm; x is mirrored for the left): down, a little out, a little back
+  const IK_GRIP_R = new THREE.Vector3(0.022, -0.066, 0.076);    // trigger hand, in the gun mesh's local space (metres)
+  const IK_GRIP_L = new THREE.Vector3(-0.030, -0.012, -0.125);  // support hand on the handguard
+  const _ik = { S0: new THREE.Vector3(), S: new THREE.Vector3(), T: new THREE.Vector3(), W: new THREE.Vector3(), E: new THREE.Vector3(),
+                D: new THREE.Vector3(), P: new THREE.Vector3(), X: new THREE.Vector3(), Y: new THREE.Vector3(), Z: new THREE.Vector3(),
+                V: new THREE.Vector3(), M: new THREE.Matrix4(), side: new THREE.Vector3(), q: new THREE.Quaternion(), qr: new THREE.Quaternion() };
+  const _gripR = new THREE.Vector3(), _gripL = new THREE.Vector3();
+  const ikFinite = v => Number.isFinite(v.x + v.y + v.z);
+  // Elbow position for shoulder S, wrist W, segment lengths lu / ll, side sign sgn (+1 right arm, -1 left arm)
+  function ikElbow(S, W, lu, ll, sgn, out) {
+    const D = _ik.D, P = _ik.P;
+    D.subVectors(W, S);
+    const raw = D.length();
+    const dist = Math.max(Math.abs(lu - ll) + 0.03, Math.min(lu + ll - 0.003, raw));
+    if (raw < 1e-5) D.set(0, 0, -1); else D.divideScalar(raw);
+    const tries = [[sgn * IK_POLE.x, IK_POLE.y, IK_POLE.z], [0, -1, 0], [sgn, 0, 0], [0, 0, 1]];
+    for (const t of tries) {                                   // first hint that isn't (nearly) parallel to the arm
+      P.set(t[0], t[1], t[2]).addScaledVector(D, -(t[0] * D.x + t[1] * D.y + t[2] * D.z));
+      if (P.lengthSq() > 1e-4) break;
+    }
+    P.normalize();
+    const along = (lu * lu - ll * ll + dist * dist) / (2 * dist);
+    const height = Math.sqrt(Math.max(1e-4, lu * lu - along * along));
+    out.copy(S).addScaledVector(D, along).addScaledVector(P, height);
+  }
+  // Put a segment frame (origin = middle of A..B, local +Y toward A, Y scaled so the mesh spans A..B) into `frame`
+  function ikSegment(frame, A, B, rest) {
+    const X = _ik.X, Y = _ik.Y, Z = _ik.Z, V = _ik.V, M = _ik.M;
+    Y.subVectors(A, B);
+    const len = Y.length();
+    if (len < 1e-5) return;
+    Y.divideScalar(len);
+    X.set(1, 0, 0).addScaledVector(Y, -Y.x);                   // keep the roll steady: local +X stays as close to the rig's right as it can
+    if (X.lengthSq() < 1e-4) X.set(0, 0, -1).addScaledVector(Y, Y.z);
+    X.normalize();
+    Z.crossVectors(X, Y);
+    Y.multiplyScalar(len / rest);
+    V.addVectors(A, B).multiplyScalar(0.5);
+    M.makeBasis(X, Y, Z).setPosition(V);
+    frame.matrix.copy(M); frame.matrixWorldNeedsUpdate = true;
+  }
+  function ikArm(side, grip, sgn, gunQ, rootInvQ) {
+    const upper = R.P[side + 'UpperArm'], lower = R.P[side + 'LowerArm'], hand = R.P[side + 'Hand'];
+    const { S0, S, T, W, E, D, X, Y, Z, M, side: lat } = _ik;
+    S0.set(0, IK_SH, 0).applyMatrix4(upper.matrix);            // true shoulder joint, from the animated pose (root space)
+    T.copy(grip); gun.localToWorld(T); R.root.worldToLocal(T); // grip point on the gun, root space
+    if (!ikFinite(S0) || !ikFinite(T)) return;
+    const Lu = IK_UP * IK_ARM, Ll = IK_LO * IK_ARM, Ln = Lu + Ll;
+    // 1. shoulder protraction: roll the shoulder toward the gun as the grip gets out of comfortable reach
+    D.subVectors(T, S0);
+    const d0 = D.length(), need = Math.max(0, Math.min(1, (d0 - 0.78 * Ln) / (0.42 * Ln)));
+    S.copy(S0).addScaledVector(D, IK_PROTRACT * need * need * (3 - 2 * need) / Math.max(d0, 1e-5));
+    // 2. hand axis (first guess points from the grip back to the shoulder), wrist sits IK_WR above the hand centre along it
+    Y.subVectors(S, T); if (Y.lengthSq() < 1e-8) Y.set(0, 1, 0); Y.normalize();
+    W.copy(T).addScaledVector(Y, IK_WR);
+    // 3. arm lengthening if the wrist is still out of reach
+    const s = Math.max(1, Math.min(IK_MAX_STRETCH, S.distanceTo(W) / (0.985 * Ln)));
+    const lu = Lu * s, ll = Ll * s;
+    // 4. elbow, then re-aim the hand along the forearm and repeat until the wrist settles (converges in 2-3 passes)
+    for (let it = 0; it < 4; it++) {
+      ikElbow(S, W, lu, ll, sgn, E);
+      Y.subVectors(E, W); if (Y.lengthSq() < 1e-8) Y.set(0, 1, 0); Y.normalize();
+      W.copy(T).addScaledVector(Y, IK_WR);
+    }
+    ikElbow(S, W, lu, ll, sgn, E);
+    // 5. meshes: upper arm S..E, forearm E..W, hand centred on the grip (+Y up the arm, fingertips forward, palm normal along the gun's side)
+    ikSegment(upper, S, E, IK_UP);
+    ikSegment(lower, E, W, IK_LO);
+    Y.subVectors(E, W); if (Y.lengthSq() < 1e-8) Y.set(0, 1, 0); Y.normalize();
+    lat.set(1, 0, 0).applyQuaternion(gunQ).applyQuaternion(rootInvQ);
+    X.copy(lat).addScaledVector(Y, -lat.dot(Y));
+    if (X.lengthSq() < 1e-4) X.set(sgn, 0, 0).addScaledVector(Y, -sgn * Y.x);
+    X.normalize();
+    Z.crossVectors(X, Y);
+    M.makeBasis(X, Y, Z).setPosition(T);
+    hand.matrix.copy(M); hand.matrixWorldNeedsUpdate = true;
+  }
+  function updateWeaponIK() {
+    R.root.updateMatrixWorld(true);
+    gunRoot.updateMatrixWorld(true);
+    gun.updateMatrixWorld(true);
+    gun.getWorldQuaternion(_ik.q);
+    R.root.getWorldQuaternion(_ik.qr).invert();
+    ikArm('Right', _gripR.copy(IK_GRIP_R).add(W.hoR), 1, _ik.q, _ik.qr);
+    ikArm('Left', _gripL.copy(IK_GRIP_L).add(W.hoL), -1, _ik.q, _ik.qr);
+  }
+  // IK-END
+
+  // NPC: plays the idle animation, turns its head to watch the player and its body follows slowly
+  function updateNpc(fdt, now) {
+    const a = ANIMS.idle; if (!a) return;
+    npc.hit = Math.max(0, npc.hit - fdt * 5);
+    npc.mat.emissive.setRGB(npc.hit * 0.8, 0, 0);               // red flash when hit
+    if (npc.dead) {
+      npc.deadT += fdt;
+      ragStep(fdt);                                             // ragdoll: the body goes limp
+      if (npc.deadT > 5) npcRevive();
+      return;
+    }
+    const px = camera.position.x - NPC_POS[0], pz = camera.position.z - NPC_POS[2];
+    const target = Math.atan2(-px, -pz);
+    let d = target - npcFace; d = Math.atan2(Math.sin(d), Math.cos(d));
+    if (Math.abs(d) > 0.5) npcFace += d * Math.min(1, 3 * fdt);       // only turns the body once the head is looking well off to the side
+    d = target - npcFace; d = Math.atan2(Math.sin(d), Math.cos(d));
+    const M = RA.pose([{ a, t: (now / 1000) % a.length, w: 1 }], { yaw: cl(d, -1, 1), pitch: 0, lean: 0, bank: 0, sq: 0 });
+    for (const jn in M) { const g = NPC.P[jn]; g.matrix.fromArray(M[jn]); g.matrixWorldNeedsUpdate = true; }
+    npc.lastM = M;
+    NPC.root.rotation.y = npcFace;
+  }
+
+  // ---------------------------------------------------------------- 4. FIXED-TIMESTEP LOOP
+  const DT = 1 / 60;
+  let acc = 0, last = performance.now();
+
+  function frame(now) {
+    requestAnimationFrame(frame);
+    const fdt = Math.min((now - last) / 1000, 0.1);
+    acc += fdt;   // clamp to avoid spiral of death after tab switch
+    yaw = yawT; pitch = pitchT;   // aim is applied directly (see mousemove); no rate-limited following
+    last = now;
+    let steps = 0;
+    while (acc >= DT && steps < 5) {
+      let stage = 'player step';
+      try {
+        stepPlayer(DT);
+        stage = 'physics step';
+        jolt.Step(DT, 1);
+      } catch (err) {
+        reportError(stage === 'player step' ? 'player step / ' + jStage : stage, err);
+        if (stage === 'player step') recoverPlayer();
+        acc = 0; break;
+      }
+      acc -= DT; steps++;
+    }
+    if (acc >= DT) acc = 0;                           // only when the step cap was hit (drop the backlog)
+
+    // Sync dynamic crates
+    for (const d of dynamicBodies) {
+      const id = d.id;
+      const p = bodies.GetPosition(id), r = bodies.GetRotation(id);
+      d.mesh.position.set(p.GetX(), p.GetY(), p.GetZ());
+      d.mesh.quaternion.set(r.GetX(), r.GetY(), r.GetZ(), r.GetW());
+    }
+
+    // Camera <- interpolated physics position (smooth at any refresh rate)
+    const a = acc / DT;
+    camera.position.lerpVectors(prevPos, curPos, a);
+    const feetX = camera.position.x, feetZ = camera.position.z;   // feet position, before any camera offsets
+    // Camera height only changes while on the ground: ducking mid-air no longer drops the view through the jump,
+    // it eases down once you land (and stays put if you un-crouch in the air)
+    if (grounded) eyeH += ((crouched ? EYE_CROUCH : EYE_STAND) - eyeH) * Math.min(1, 10 * fdt);
+    // Body-mounted: height follows the torso, so stairs/ramps lift it with a short lag rather than popping
+    smoothY += (camera.position.y - smoothY) * Math.min(1, (grounded ? 10 : 30) * fdt);
+    if (!grounded) smoothY = Math.max(camera.position.y - 0.05, Math.min(camera.position.y + 0.05, smoothY));   // catch up quickly in the air instead of snapping
+
+    const hs = Math.hypot(vx, vz), moving = grounded && hs > 0.4;
+    hsS += (hs - hsS) * Math.min(1, 6 * fdt);
+    const lerp = (x, y, t) => x + (y - x) * t;
+    const smooth = (e0, e1, x) => { const t = Math.max(0, Math.min(1, (x - e0) / (e1 - e0))); return t * t * (3 - 2 * t); };
+    // Gait model from biomechanics data: natural cadence ~1.8-2.0 steps/s walking, ~2.7-3.2 jogging,
+    // ~3.6+ sprinting; centre-of-mass bob ~4-5 cm walking, ~6-9 cm running; lateral sway shrinks as speed rises.
+    // Both the blend and the cadence are low-passed on top of hsS, so the walk -> run change in bob size,
+    // sway, lean and step rate eases in over ~1s instead of switching over a narrow speed band.
+    runBS += (smooth(1.6, 5.2, hsS) - runBS) * Math.min(1, 2.5 * fdt);
+    const runB = runBS;                                                       // walk -> run blend
+    const cadTarget = hsS > 0.3 ? Math.min(6.5, Math.max(1.2, animStepRate)) : 1.5;   // steps per second = what the planted feet actually do
+    cadS = 1 / (sprinting ? STEP_INTERVAL_SPRINT : STEP_INTERVAL_WALK);   // 0.4 s sprinting, 0.6 s walking
+    const cadence = cadS;
+    // Stopping eases out: the bob amount follows speed continuously (no on/off threshold), settles slowly,
+    // and the step phase keeps running while it fades, so the camera glides to rest instead of freezing mid-stride.
+    const bobTarget = grounded ? smooth(0.15, 1.2, hs) : 0;
+    bobAmt += (bobTarget - bobAmt) * Math.min(1, (bobTarget > bobAmt ? 6 : 3) * fdt);
+    if (bobAmt > 0.005) bobPhase += 2 * Math.PI * cadence * fdt;               // 2*pi per step
+    else { bobPhase = -1.5; stepIdx = -1; }                                    // idle: re-arm so the first step lands shortly after you start moving
+    const cm = crouched ? 0.7 : 1;
+
+    // Foot strike: impact transient transmitted into the chest mount
+    const stepNow = Math.floor((bobPhase - 0.6 * runB) / (2 * Math.PI));   // camera is lowest at this phase = foot plant
+    if (stepNow !== stepIdx) {                        // a foot just planted (once per step interval)
+      stepIdx = stepNow;
+      if (moving) {   // no footstep jolt/sound while just gliding to rest
+        jV -= (0.085 + 0.043 * hsS) * cm; jPV -= (0.105 + 0.048 * hsS) * cm;
+        thud(0.03 + 0.012 * Math.min(hsS, 6), 110 + Math.random() * 30);
+      }
+    }
+    // Stiff springs in small substeps: foot-strike ringing, and the torso trailing the mouse aim
+    const sstep = x => { x = Math.min(1, x); return x * x * (3 - 2 * x); };
+    const dHY = (W.hY - W.pY) / Math.max(fdt, 1e-4), dHP = (W.hP - W.pP) / Math.max(fdt, 1e-4);   // gun turn rate (rad/s)
+    W.pY = W.hY; W.pP = W.hP;
+    for (let rem = fdt; rem > 0;) {
+      const h = Math.min(rem, 1 / 120); rem -= h;
+      jV += (-650 * jY - 38 * jV) * h; jY += jV * h;               // well damped: one soft dip per footfall, no ringing
+      jPV += (-650 * jP - 38 * jPV) * h; jP += jPV * h;
+      // camera slowly catches up to the gun: gentle at the hip, snaps onto the sights when aiming, and speeds up as the gun gets far ahead
+      // Spring-arm rotation lag (the video's first technique, Unreal's CameraRotationLagSpeed): the camera rotation is interpolated toward the
+      // aim with a single lag speed, in small sub-steps so it is frame-rate independent. Low speed = heavy, smooth lag. Time to ~99%: ln(100) / speed.
+      // The camera only moves when the gun moves: it takes a share of the gun's turning, and that share grows the farther the gun is ahead.
+      // Nothing pulls the gun back to centre on its own. Only aiming down sights (and third person) bring the view onto the gun.
+      const gapY = W.hY - cy, gapP = W.hP - cp;
+      const tY = thirdPerson ? 1 : 0.18 + 0.82 * sstep(Math.abs(gapY) / 0.9), tP = thirdPerson ? 1 : 0.18 + 0.82 * sstep(Math.abs(gapP) / 0.6);
+      const sm = Math.min(1, 12 * h);                                 // preserves the original fast, smooth camera response
+      W.cvY += (dHY * tY - W.cvY) * sm; W.cvP += (dHP * tP - W.cvP) * sm;
+      // Fast, critically damped catch-up: preserve the camera's momentum and speed,
+      // but ease it into the aim target instead of abruptly clamping/stopping at it.
+      const omega = thirdPerson ? 24 : lerpf(17, 24, W.ads);
+      const decay = Math.exp(-omega * h);
+      const xY = cy - W.hY, xP = cp - W.hP;
+      const tempY = (W.cvY + omega * xY) * h;
+      const tempP = (W.cvP + omega * xP) * h;
+      cy = W.hY + (xY + tempY) * decay;
+      cp = W.hP + (xP + tempP) * decay;
+      W.cvY = (W.cvY - omega * tempY) * decay;
+      W.cvP = (W.cvP - omega * tempP) * decay;
+    }
+
+    breathT += fdt * (1.2 + (100 - stamina) / 40);
+    const breath = Math.sin(breathT * 2) * 0.004 * (1 + (100 - stamina) / 35);   // chest rise/fall
+    aSm += (accLong - aSm) * Math.min(1, 5 * fdt);
+    const accelPitch = Math.max(-0.05, Math.min(0.05, -aSm * 0.003));          // lean into accel, rock back on braking
+    const strafe = vx * Math.cos(cy) + vz * -Math.sin(cy);
+    const fwdV = -(vx * Math.sin(cy) + vz * Math.cos(cy));   // + forward, - backward (local)
+    roll += (-strafe * 0.007 - roll) * Math.min(1, 8 * fdt);                  // bank into the strafe
+    dirP += (Math.max(-0.05, Math.min(0.05, -fwdV * 0.006)) - dirP) * Math.min(1, 6 * fdt);   // dip forward when moving forward, tip up when backing
+    dirLat += (Math.max(-0.03, Math.min(0.03, -strafe * 0.006)) - dirLat) * Math.min(1, 6 * fdt);   // body shifts opposite the strafe
+    const t = now / 1000, idle = 1 - bobAmt;                                      // postural sway when standing
+    const swayY = idle * (0.0025 * Math.sin(t * 0.7) + 0.0015 * Math.sin(t * 1.9 + 1));
+    const swayP = idle * 0.002 * Math.sin(t * 0.9 + 2);
+    // In the air the head tips slightly up while rising and down while falling
+    airP += ((grounded ? 0 : Math.max(-0.05, Math.min(0.04, vy * 0.008))) - airP) * Math.min(1, 6 * fdt);
+
+    // Turn sway: fast mouse turns bank the camera into the turn (yaw rate, smoothed)
+    yrS += ((yaw - lastYaw) / Math.max(fdt, 1e-3) - yrS) * Math.min(1, 12 * fdt); lastYaw = yaw;
+    const turnRoll = Math.max(-0.03, Math.min(0.03, yrS * 0.004));
+    // Stress / exhaustion: low stamina and hard sprinting add a fine hand-and-chest tremor
+    stress += (Math.min(1, 0.9 * (1 - stamina / 100) + (sprinting ? 0.3 : 0)) - stress) * Math.min(1, 0.8 * fdt);
+    const trY = stress * 0.0035 * (Math.sin(t * 17) + 0.6 * Math.sin(t * 29 + 1));
+    const trP = stress * 0.0035 * (Math.sin(t * 19 + 2) + 0.6 * Math.sin(t * 31));
+
+    // Torso gait (th = step phase; sway/twist/roll repeat every 2 steps, bob/nod every step)
+    const th = bobPhase, A = bobAmt * cm * Math.min(1.4, 0.35 + hsS / 6) * (fwdV < -0.5 ? 0.7 : 1);   // shake scales with speed, softer backing up
+    const vert = -lerp(0.024, 0.030, runB) * A * (Math.cos(th - 0.6 * runB) - 0.1 * Math.sin(th / 2));
+    const lat = lerp(0.027, 0.017, runB) * A * Math.sin(th / 2);
+    const twist = lerp(0.052, 0.058, runB) * A * Math.cos(th / 2);                 // shoulders counter-rotate (~2-5 deg)
+    const rollB = -lerp(0.032, 0.036, runB) * A * Math.sin(th / 2);
+    const nod = lerp(0.014, 0.018, runB) * A * Math.cos(th - 0.8);
+    const lean = -(0.02 + 0.04 * runB * Math.min(1, hsS / 6)) * bobAmt;         // forward trunk lean when running
+
+    // Movement-state layers: idle / walk / run / air each have their own noise amplitude + frequency, blended continuously
+    const gW = grounded ? 1 : 0;
+    const wIdle = (1 - bobAmt) * gW, wWalk = bobAmt * (1 - runB) * gW, wRun = bobAmt * runB * gW, wAir = 1 - gW;
+    const nAmp = (wIdle * 0.0015 + wWalk * 0.004 + wRun * 0.008 + wAir * 0.006) * cm;       // radians
+    const nFrq = wIdle * 0.6 + wWalk * 1.4 + wRun * 2.2 + wAir * 1.8;                       // Hz-ish
+    const nPos = (wIdle * 0.002 + wWalk * 0.004 + wRun * 0.007 + wAir * 0.005) * cm;        // metres (before player scale)
+    nzT += Math.min(fdt, 1 / 30) * nFrq;                                                    // phase accumulates, so no jump when the layer blend changes
+    for (let rem = Math.min(fdt, 1 / 30); rem > 0;) {
+      const h = Math.min(rem, 1 / 120); rem -= h;
+      for (let i = 0; i < 6; i++) {
+        const tgt = vnoise(nzT + i * 17.3);
+        nzV[i] += (900 * (tgt - nzX[i]) - 60 * nzV[i]) * h; nzX[i] += nzV[i] * h;           // spring gives the noise inertia
+      }
+    }
+    const lim = v => Math.max(-HEAD_LIM, Math.min(HEAD_LIM, v));                           // head travel limit
+    const offX = lim(lat + dirLat + nzX[3] * nPos), offF = lim(nzX[5] * nPos), offY = lim(vert + jY + landY + breath * 1.5 + nzX[4] * nPos);
+    camera.position.x += (Math.cos(cy) * offX - Math.sin(cy) * offF) * PS * CAM_POS_FX;
+    camera.position.z += (-Math.sin(cy) * offX - Math.cos(cy) * offF) * PS * CAM_POS_FX;
+    // Looking down: the view must never end up inside the body. The camera glides forward as you pitch down (clear of the chest and
+    // shoulders), and once you look steeply down the chest / upper belly meshes are hidden, so the near plane can't cut through them
+    // and show the inside of the torso. (Hysteresis stops it flickering at the threshold.) Always restored in third person.
+    const lookDown = thirdPerson ? 0 : clampf(-cp / 1.2, 0, 1);
+    const hideUpper = !thirdPerson && (upperHidden ? lookDown > 0.38 : lookDown > 0.5);
+    if (hideUpper !== upperHidden) { upperHidden = hideUpper; for (const k of ['chest', 'belly1', 'belly2']) for (const m of R.meshes[k]) m.mesh.visible = !hideUpper; }
+    if (!thirdPerson) {
+      const crouchB = clampf((EYE_STAND - eyeH) / (EYE_STAND - EYE_CROUCH), 0, 1);   // 0 standing .. 1 crouched, follows the eye-height ease
+      const fwd = FP_FWD + CROUCH_FWD * crouchB + LOOK_DOWN_FWD * lookDown * lookDown * (3 - 2 * lookDown);
+      camera.position.x -= Math.sin(cy) * fwd; camera.position.z -= Math.cos(cy) * fwd;
+    }   // sit just in front of the face/chest so the torso and arms are visible below
+    camera.position.y = smoothY + eyeH + offY * PS * CAM_POS_FX;   // positional bob scales with body size
+    // Head stabilisation trims pitch/yaw shake (the part that moves your aim); roll doesn't move aim, so it carries the feedback
+    const S = 1 - STAB;
+    const footRoll = jP * 2 * Math.sin(th / 2), landRoll = landY * 0.8 * (roll >= 0 ? 1 : -1);
+    const camPitch = cp + CAM_FX * S * (dirP + lean + accelPitch + nod + jP + landY * 0.8 + breath * 0.8 + swayP + trP + airP + nzX[0] * nAmp);
+    camera.rotation.set(Math.max(-1.55, Math.min(1.55, camPitch)),   // extra bob terms must not carry the view past straight up/down
+                        cy + CAM_FX * S * (twist + swayY + trY + nzX[1] * nAmp),
+                        CAM_FX * (roll + rollB + turnRoll + footRoll + landRoll + nzX[2] * nAmp * 1.5));
+
+    // Rotate the character from the weapon's actual heading, not the chase-camera heading.
+    // In first person the weapon is based on the chest-camera yaw plus its own lead/lag;
+    // in third person it is based on the player's aim yaw plus the weapon offset.
+    updateAim(fdt);                                   // this frame's weapon heading first, so body and hands agree
+    const weaponBodyYaw = thirdPerson ? (yaw + W.gY) : (cy + W.gY);
+    updateRig(fdt, feetX, smoothY, feetZ, weaponBodyYaw);
+    updateWeapon(fdt, now);
+    updateWeaponIK();
+    updateNpc(fdt, now);
+    if (thirdPerson) {                                // pull the camera back behind the player, stopping at walls
+      tpFwd.set(0, 0, -1).applyQuaternion(camera.quaternion);
+      camera.position.y += 0.15 * PS;
+      let dist = 3.2 * PS * tpZoom;
+      const sgn = camMode === 2 ? -1 : 1;             // 1 = behind the player, -1 = in front of the player
+      try {
+        const f = castRay(camera.position.x, camera.position.y, camera.position.z, -sgn * tpFwd.x * dist, -sgn * tpFwd.y * dist, -sgn * tpFwd.z * dist);
+        if (f >= 0) dist = Math.max(0.5, f * dist - 0.25);
+      } catch (e) {}
+      if (camMode === 2) {                            // front view: sit ahead of the player along the look direction and turn to face them
+        const pivot = camera.position.clone();
+        camera.position.addScaledVector(tpFwd, dist);
+        camera.up.set(0, 1, 0);
+        camera.lookAt(pivot);
+      } else camera.position.addScaledVector(tpFwd, -dist);
+    }
+
+    hud.textContent =
+      'ground: ' + (grounded ? 'yes' : 'no') +
+      '\nspeed:  ' + Math.hypot(vx, vz).toFixed(1) + ' m/s' +
+      '\nvert:   ' + vy.toFixed(1) + ' m/s' +
+      '\nstance: ' + (crouched ? 'crouch' : sprinting ? 'sprint' : 'walk') +
+      '\nstamina: ' + Math.round(stamina) + (exhausted ? ' (winded)' : '') +
+      '\nweapon: ' + wpnHud() +
+      '\nanim:   ' + animInfo +
+      (performance.now() - animMsgAt < 8000 ? '\n' + animMsg : '') +
+      (now - errAt < 20000 ? '\n' + errText : '');
+    renderer.render(scene, camera);
+  }
+
+  addEventListener('resize', () => {
+    camera.aspect = innerWidth / innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(innerWidth, innerHeight);
+  });
+
+  statusEl.textContent = 'Ready — click anywhere to capture the mouse.';
+  requestAnimationFrame(t => { last = t; frame(t); });
+})();
+</script>
+</body>
+</html>
